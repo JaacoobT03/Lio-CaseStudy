@@ -33,7 +33,9 @@ Development happens in the **Acme Corp** organization, which has one of each rol
 | `buyer@acme.com` | buyer | approve requests |
 | `requester@acme.com` | requester | create & track requests |
 
-Every request needs approval by a buyer or admin (see the **Approvals** tab).
+Every request needs approval by a buyer or admin (see the **Approvals** tab),
+unless the organization approves small requests automatically (Acme: below
+€2,000 net, set under **Organization → Settings**).
 
 Other tenants exist to show the multi-tenant setup — **Walmart, Schaeffler,
 Siemens, BMW** — each with an admin at `admin@<company>.com` (same password).
@@ -44,6 +46,20 @@ accounts, organizations, commodity groups, suppliers) — both steps are
 idempotent, so restarts never duplicate or overwrite anything (your data lives
 in the `postgres_data` volume; `docker compose down -v` resets it). The OpenAI
 key is only needed for PDF extraction — everything else works without it.
+
+## Per-organization setup
+
+Customer-specific behaviour is data, not code: it lives in each organization's
+settings (JSON, validated by `OrganizationSettings`) or in rows that belong to
+the organization. Acme's setup is seeded in `backend/app/seed.py`.
+
+| Setting | Acme | Changed via |
+| --- | --- | --- |
+| Required request fields | none | Organization → Settings |
+| Automatic approval below (net) | €2,000 | Organization → Settings |
+| Booking rules (keywords → commodity group) | cable ties → Electrical Engineering, printer toner → IT Hardware, small software subscriptions → Office Supplies | seed / API |
+| Own commodity groups | "Office Supplies" (only visible to Acme) | seed |
+| Catalog (suppliers, articles, negotiated prices) | yes | seed |
 
 ## Local development
 
@@ -69,6 +85,18 @@ npm run dev
 ```bash
 cd backend && python -m pytest      # API tests (in-memory SQLite)
 cd frontend && npx tsc --noEmit && npm run build
+```
+
+### Extraction eval
+
+The five sample quotes are graded against an answer key
+(`backend/evals/ground_truth.json`, 8 checks per quote). The PDFs aren't in the
+repo because they contain personal data; put them in a folder and run, with
+`OPENAI_API_KEY` set and the stack up:
+
+```bash
+docker compose cp <quotes-folder> backend:/tmp/quotes
+docker compose exec backend python -m evals.run_eval /tmp/quotes --runs 3
 ```
 
 ## Layout
