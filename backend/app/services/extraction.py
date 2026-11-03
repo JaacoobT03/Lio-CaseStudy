@@ -1,5 +1,9 @@
+import base64
 import json
 import logging
+import re
+import time
+import unicodedata
 
 from openai import OpenAI
 from sqlalchemy import select
@@ -8,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models import CommodityGroup
 from app.schemas.extraction import ExtractedVendorData, ExtractionResponse
+from app.services.pdf import extract_text
 
 logger = logging.getLogger(__name__)
 
@@ -18,14 +23,24 @@ SYSTEM_PROMPT = (
     "group based on the full context of the offer."
 )
 
+# If any of these is still missing after reading the PDF's text, we give the
+# model the PDF itself (text + page images), e.g. for a letterhead that is an image.
+KEY_FIELDS = {"Vendor Name", "VAT ID", "Order Lines", "Total Cost"}
 
-def _build_prompt(pdf_text: str, commodity_groups_list: str) -> str:
-    return f"""You are a data extraction and classification specialist. Extract procurement/vendor offer information from the following German document text AND classify it into the appropriate commodity group.
+# Legal forms and filler words, ignored when comparing company names.
+NAME_NOISE = {"gmbh", "mbh", "ag", "kg", "se", "co", "ltd", "inc", "und", "and"}
 
-Document Text:
-{pdf_text}
 
-Please extract the following information:
+def _build_prompt(commodity_groups_list: str, pdf_text: str | None = None) -> str:
+    """The extraction prompt. With pdf_text the document is pasted in as text;
+    without it, the prompt refers to the PDF attached to the same message."""
+    if pdf_text is None:
+        source, document = "the attached PDF (a German vendor quote)", ""
+    else:
+        source, document = "the following German document text", f"Document Text:\n{pdf_text}\n\n"
+    return f"""You are a data extraction and classification specialist. Extract procurement/vendor offer information from {source} AND classify it into the appropriate commodity group.
+
+{document}Please extract the following information:
 1. Title/Short Description (A brief summary of what this procurement is for - e.g., "Office Equipment Purchase", "Software Licenses", etc.)
 2. Vendor Name (Lieferant/Anbieter/Firma/Company name)
 3. VAT ID (Umsatzsteuer-Identifikationsnummer/VAT ID/USt-IdNr/Tax ID)
@@ -86,13 +101,122 @@ def _strip_markdown_fences(content: str) -> str:
     return cleaned
 
 
-def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
-    """Extract vendor data and classify commodity group in one AI call.
+def _pdf_message(pdf_bytes: bytes, filename: str, commodity_groups_list: str) -> list[dict]:
+    """A user message carrying the PDF itself (the Responses API gives the model its
+    text and an image of each page) plus the prompt."""
+    encoded = base64.b64encode(pdf_bytes).decode()
+    return [
+        {"type": "input_file", "filename": filename, "file_data": f"data:application/pdf;base64,{encoded}"},
+        {"type": "input_text", "text": _build_prompt(commodity_groups_list)},
+    ]
 
-    Port of ``src/actions/extraction.ts`` — same prompt, model and validation.
+
+def _model_options() -> dict:
+    """Reasoning models (e.g. Luna) take an effort level instead of a temperature;
+    leave OPENAI_REASONING_EFFORT empty for older models such as gpt-4o-mini."""
+    if settings.openai_reasoning_effort:
+        return {"reasoning": {"effort": settings.openai_reasoning_effort}}
+    return {"temperature": 0.3}
+
+
+def _ask_model(client: OpenAI, user_content: str | list[dict], label: str) -> ExtractedVendorData:
+    """One extraction call. Raises if the reply is cut off, empty or isn't valid data."""
+    started = time.monotonic()
+    response = client.responses.create(
+        model=settings.openai_model,
+        instructions=SYSTEM_PROMPT,
+        input=[{"role": "user", "content": user_content}],
+        max_output_tokens=8000,  # includes the model's reasoning, not just the answer
+        store=False,  # don't keep customer quotes on OpenAI's side
+        **_model_options(),
+    )
+    if response.usage:
+        logger.info(
+            "%s pass: %s input + %s output tokens, %.1fs", label,
+            response.usage.input_tokens, response.usage.output_tokens, time.monotonic() - started,
+        )
+    if response.status == "incomplete":
+        raise ValueError(f"The model stopped early: {response.incomplete_details}")
+    content = response.output_text
+    if not content:
+        raise ValueError("Empty response from AI")
+    return ExtractedVendorData.model_validate(json.loads(_strip_markdown_fences(content)))
+
+
+def _missing_fields(data: ExtractedVendorData, valid_group_ids: set[int]) -> list[str]:
+    """Fields the user has to fill in by hand (same rules as the original).
+    An unknown commodity group id is dropped and counts as missing."""
+    if data.commodity_group_id is not None and data.commodity_group_id not in valid_group_ids:
+        logger.warning("Invalid commodity group ID returned: %s", data.commodity_group_id)
+        data.commodity_group_id = None
+        data.commodity_group_name = None
+
+    missing_fields: list[str] = []
+    if not (data.title or "").strip():
+        missing_fields.append("Title/Short Description")
+    if not (data.vendor_name or "").strip():
+        missing_fields.append("Vendor Name")
+    if not (data.vat_id or "").strip():
+        missing_fields.append("VAT ID")
+    if not (data.department or "").strip():
+        missing_fields.append("Department")
+    if not data.order_lines:
+        missing_fields.append("Order Lines")
+    if not data.total_cost:
+        missing_fields.append("Total Cost")
+    if not data.commodity_group_id or not data.commodity_group_name:
+        missing_fields.append("Commodity Group")
+    return missing_fields
+
+
+def _fill_gaps(primary: ExtractedVendorData, backup: ExtractedVendorData) -> None:
+    """Copy a value from `backup` into `primary` only where `primary` has none."""
+    for field in ExtractedVendorData.model_fields:
+        if not getattr(primary, field) and getattr(backup, field):
+            setattr(primary, field, getattr(backup, field))
+
+
+def _name_words(name: str) -> set[str]:
+    """'Hoffmann Nürnberg GmbH' -> {'hoffmann', 'nurnberg'}: lower case, accents
+    removed, legal form dropped."""
+    plain = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    return set(re.findall(r"[a-z0-9]+", plain)) - NAME_NOISE
+
+
+def _disagreements(from_text: ExtractedVendorData, from_pdf: ExtractedVendorData) -> list[str]:
+    """Warnings for fields that both passes found but read differently."""
+    def comparable(value) -> str:  # ignore case and spaces: "DE 123" == "de123"
+        return "".join(str(value).split()).lower()
+
+    def warning(label, text_value, pdf_value) -> str:
+        return (f"{label}: the text says '{text_value}', the PDF says '{pdf_value}'. "
+                "We used the PDF reading, please check.")
+
+    warnings = []
+    # Names count as the same company if they share a word, so "styleGREEN / FlowerArt
+    # GmbH" vs "FlowerArt GmbH (styleGREEN)" is fine; only unrelated names are flagged.
+    text_vendor, pdf_vendor = from_text.vendor_name, from_pdf.vendor_name
+    if text_vendor and pdf_vendor and not _name_words(text_vendor) & _name_words(pdf_vendor):
+        warnings.append(warning("Vendor", text_vendor, pdf_vendor))
+    for label, text_value, pdf_value in [
+        ("VAT ID", from_text.vat_id, from_pdf.vat_id),
+        ("Total", from_text.total_cost, from_pdf.total_cost),
+    ]:
+        if text_value and pdf_value and comparable(text_value) != comparable(pdf_value):
+            warnings.append(warning(label, text_value, pdf_value))
+    return warnings
+
+
+def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> ExtractionResponse:
+    """Extract vendor data from a quote PDF and classify its commodity group.
+
+    Pass 1 gives the model the PDF's text (cheap). Only if a key field is still
+    missing does pass 2 give it the PDF itself (text + page images). When both
+    passes ran, the PDF reading wins, pass 1 fills its gaps, and fields the two
+    read differently are reported as warnings.
     """
-    if not pdf_text or not pdf_text.strip():
-        return ExtractionResponse(success=False, error="No text provided for extraction")
+    if not pdf_bytes:
+        return ExtractionResponse(success=False, error="The uploaded file is empty")
 
     if not settings.openai_api_key:
         return ExtractionResponse(
@@ -114,61 +238,48 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
     commodity_groups_list = "\n".join(
         f"{g.id} | {g.category} | {g.name}" for g in commodity_groups
     )
+    valid_group_ids = {g.id for g in commodity_groups}
+    client = OpenAI(api_key=settings.openai_api_key)
 
+    # Pass 1: the PDF's text layer. Skipped if there is none (e.g. a scanned PDF).
+    from_text = None
     try:
-        client = OpenAI(api_key=settings.openai_api_key)
-        response = client.chat.completions.create(
-            model=settings.openai_model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _build_prompt(pdf_text, commodity_groups_list)},
-            ],
-            max_completion_tokens=4000,
-            temperature=0.3,
-        )
+        pdf_text = extract_text(pdf_bytes)
+        if pdf_text.strip():
+            from_text = _ask_model(client, _build_prompt(commodity_groups_list, pdf_text), "Text")
+    except Exception:  # noqa: BLE001 — pass 2 still gets its chance
+        logger.exception("Extraction from the PDF text failed")
 
-        content = response.choices[0].message.content
-        if not content:
-            return ExtractionResponse(success=False, error="Empty response from AI")
+    if from_text is not None:
+        missing_fields = _missing_fields(from_text, valid_group_ids)
+        if not KEY_FIELDS.intersection(missing_fields):
+            return ExtractionResponse(
+                success=True, data=from_text, missing_fields=missing_fields or None
+            )
+        logger.info("Missing after the text pass: %s -> reading the PDF itself", ", ".join(missing_fields))
 
-        extracted = ExtractedVendorData.model_validate(
-            json.loads(_strip_markdown_fences(content))
+    # Pass 2: the PDF itself.
+    try:
+        from_pdf = _ask_model(
+            client, _pdf_message(pdf_bytes, filename, commodity_groups_list), "PDF"
         )
     except Exception as exc:  # noqa: BLE001 — mirror the original catch-all
-        logger.exception("Error extracting vendor data")
-        return ExtractionResponse(success=False, error=str(exc))
+        logger.exception("Extraction from the PDF itself failed")
+        if from_text is None:
+            return ExtractionResponse(success=False, error=str(exc))
+        # Keep what the text pass found rather than losing everything.
+        return ExtractionResponse(
+            success=True, data=from_text, missing_fields=missing_fields or None
+        )
 
-    # Check which fields are missing or empty (same rules as the original).
-    missing_fields: list[str] = []
-    if not (extracted.title or "").strip():
-        missing_fields.append("Title/Short Description")
-    if not (extracted.vendor_name or "").strip():
-        missing_fields.append("Vendor Name")
-    if not (extracted.vat_id or "").strip():
-        missing_fields.append("VAT ID")
-    if not (extracted.department or "").strip():
-        missing_fields.append("Department")
-    if not extracted.order_lines:
-        missing_fields.append("Order Lines")
-    if not extracted.total_cost:
-        missing_fields.append("Total Cost")
-    if not extracted.commodity_group_id or not extracted.commodity_group_name:
-        missing_fields.append("Commodity Group")
-
-    # Validate that the returned commodity group id actually exists.
-    if extracted.commodity_group_id is not None:
-        valid_ids = {g.id for g in commodity_groups}
-        if extracted.commodity_group_id not in valid_ids:
-            logger.warning(
-                "Invalid commodity group ID returned: %s", extracted.commodity_group_id
-            )
-            extracted.commodity_group_id = None
-            extracted.commodity_group_name = None
-            if "Commodity Group" not in missing_fields:
-                missing_fields.append("Commodity Group")
-
+    warnings: list[str] = []
+    if from_text is not None:
+        warnings = _disagreements(from_text, from_pdf)
+        _fill_gaps(from_pdf, from_text)
+    missing_fields = _missing_fields(from_pdf, valid_group_ids)
     return ExtractionResponse(
         success=True,
-        data=extracted,
+        data=from_pdf,
         missing_fields=missing_fields or None,
+        warnings=warnings or None,
     )

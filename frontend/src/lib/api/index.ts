@@ -100,6 +100,7 @@ export interface ExtractionResponse {
   data?: ExtractedVendorData;
   error?: string;
   missingFields?: string[];
+  warnings?: string[];
 }
 
 export interface Supplier {
@@ -330,7 +331,10 @@ export const pdf = {
 };
 
 export const extraction = {
-  extract(text: string): Promise<ExtractionResponse> {
-    return apiFetch('/extraction', { body: { text } });
+  /** Send the quote PDF itself; the backend reads it (text first, the PDF if needed). */
+  extract(file: File): Promise<ExtractionResponse> {
+    const formData = new FormData();
+    formData.append('file', file);
+    return apiFetch('/extraction', { formData });
   },
 };

@@ -5,10 +5,6 @@ class PdfParseResponse(BaseModel):
     text: str
 
 
-class ExtractionRequest(BaseModel):
-    text: str
-
-
 # camelCase on the wire — matches the AI's JSON output format and what the
 # frontend's extraction flow already consumes.
 class OrderLineData(BaseModel):
@@ -43,3 +39,5 @@ class ExtractionResponse(BaseModel):
     data: ExtractedVendorData | None = None
     error: str | None = None
     missing_fields: list[str] | None = Field(default=None, alias="missingFields")
+    # e.g. where the text and the PDF reading of a quote disagreed
+    warnings: list[str] | None = None

@@ -481,67 +481,164 @@ def test_activity_log_and_document():
     client.delete(f"/requests/{rid}", headers=_auth(admin))
 
 
+def _tiny_pdf() -> bytes:
+    """A blank one-page PDF, enough to pass the upload checks."""
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def _upload_for_extraction(token: str) -> dict:
+    r = client.post(
+        "/extraction",
+        files={"file": ("quote.pdf", _tiny_pdf(), "application/pdf")},
+        headers=_auth(token),
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
 def test_extraction_without_api_key():
     r = client.post("/auth/signup", json={"email": "ex@example.com", "password": "secret123"})
     token = r.json()["access_token"]
 
-    r = client.post("/extraction", json={"text": "Angebot Nr. 123"}, headers=_auth(token))
-    assert r.status_code == 200
-    body = r.json()
+    body = _upload_for_extraction(token)
     # Without OPENAI_API_KEY configured the endpoint reports a clean failure
     # envelope rather than an HTTP error.
     assert body["success"] is False
     assert "OPENAI_API_KEY" in body["error"]
 
-    # empty text
-    r = client.post("/extraction", json={"text": "  "}, headers=_auth(token))
-    assert r.json()["success"] is False
+    # non-PDF rejected
+    r = client.post(
+        "/extraction",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+        headers=_auth(token),
+    )
+    assert r.status_code == 400
 
 
 class FakeOpenAI:
-    """Stands in for openai.OpenAI in tests: returns `reply` as the model's
-    answer and remembers the last request, so no real API call is made."""
+    """Stands in for openai.OpenAI in tests: answers each call with the next
+    reply from `replies` and remembers every request, so no real API call is made."""
 
-    reply = ""
-    last_request: dict = {}
+    replies: list[str] = []
+    requests: list[dict] = []
 
     def __init__(self, api_key=None):
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+        self.responses = SimpleNamespace(create=self._create)
 
     def _create(self, **request):
-        FakeOpenAI.last_request = request
-        message = SimpleNamespace(content=FakeOpenAI.reply, refusal=None)
-        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")])
+        FakeOpenAI.requests.append(request)
+        return SimpleNamespace(
+            output_text=FakeOpenAI.replies.pop(0), status="completed",
+            incomplete_details=None, usage=None,
+        )
 
 
-def test_extraction_survives_missing_vat_id(monkeypatch):
-    """A quote without a VAT ID (e.g. Hoffmann) used to fail the whole
-    extraction: the model correctly answers null, the schema rejected it."""
+def _use_fake_openai(monkeypatch, *replies: dict, pdf_text: str):
+    """Route extraction through FakeOpenAI, one reply per model call.
+    `pdf_text` is what pypdf "finds" in the uploaded PDF ("" = no text layer)."""
     from app.core.config import settings
     from app.services import extraction
 
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
     monkeypatch.setattr(extraction, "OpenAI", FakeOpenAI)
-    FakeOpenAI.reply = json.dumps({
-        "title": "Grinding machine",
-        "vendorName": "Hoffmann Nurnberg GmbH",
-        "vatId": None,
-        "department": None,
-        "orderLines": [{"positionDescription": "Schleifmaschine HN-GS 450", "unitPrice": 15000,
-                        "amount": 1, "unit": "piece", "totalPrice": 15000}],
-        "totalCost": 15000,
-        "commodityGroupId": 45,
-        "commodityGroupName": "Production Machinery",
-    })
+    monkeypatch.setattr(extraction, "extract_text", lambda pdf_bytes: pdf_text)
+    FakeOpenAI.replies = [json.dumps(reply) for reply in replies]
+    FakeOpenAI.requests = []
+    r = client.post("/auth/signup", json={"email": f"{uuid.uuid4().hex}@example.com", "password": "secret123"})
+    return r.json()["access_token"]
 
-    r = client.post("/auth/signup", json={"email": "novat@example.com", "password": "secret123"})
-    token = r.json()["access_token"]
-    r = client.post("/extraction", json={"text": "Angebot ANG-HN-2026-041"}, headers=_auth(token))
 
-    body = r.json()
+def _sent_pdf(request: dict) -> bool:
+    """Did this model call carry the PDF file itself?"""
+    content = request["input"][0]["content"]
+    return isinstance(content, list) and content[0]["type"] == "input_file"
+
+
+# A complete answer, as the model gives it for a quote it can read fully.
+COMPLETE_REPLY = {
+    "title": "Moss wall",
+    "vendorName": "FlowerArt GmbH",
+    "vatId": "DE271073640",
+    "department": None,
+    "orderLines": [{"positionDescription": "Moss module", "unitPrice": 559,
+                    "amount": 1.28, "unit": "m²", "totalPrice": 715.52}],
+    "totalCost": 715.52,
+    "commodityGroupId": 15,
+    "commodityGroupName": "Office Equipment",
+}
+
+
+def test_extraction_reads_text_first(monkeypatch):
+    """If the text gives us every key field, the PDF is never sent: one cheap call."""
+    token = _use_fake_openai(monkeypatch, COMPLETE_REPLY, pdf_text="Angebot OF2312380 ...")
+
+    body = _upload_for_extraction(token)
+
     assert body["success"] is True, body
+    assert len(FakeOpenAI.requests) == 1
+    assert not _sent_pdf(FakeOpenAI.requests[0])
+    assert FakeOpenAI.requests[0]["store"] is False  # customer quotes aren't kept at OpenAI
+
+
+def test_extraction_falls_back_to_pdf(monkeypatch):
+    """styleGREEN: the text lacks the VAT ID (it's in an image) and names the customer
+    as vendor. The PDF pass is used, and the vendor disagreement is flagged."""
+    from_text = {**COMPLETE_REPLY, "vendorName": "Lio Technologies GmbH", "vatId": None}
+    token = _use_fake_openai(monkeypatch, from_text, COMPLETE_REPLY, pdf_text="Angebot OF2312380 ...")
+
+    body = _upload_for_extraction(token)
+
+    assert body["success"] is True, body
+    assert len(FakeOpenAI.requests) == 2
+    assert not _sent_pdf(FakeOpenAI.requests[0]) and _sent_pdf(FakeOpenAI.requests[1])
+    assert body["data"]["vendorName"] == "FlowerArt GmbH"
+    assert body["data"]["vatId"] == "DE271073640"
+    assert any("Vendor" in warning for warning in body["warnings"])
+
+
+def test_same_vendor_spelled_differently_is_not_flagged():
+    """Real cases from the eval: the same company written two ways is not a
+    disagreement; two unrelated names are."""
+    from app.schemas.extraction import ExtractedVendorData as Data
+    from app.services.extraction import _disagreements
+
+    assert _disagreements(Data(vendorName="styleGREEN / FlowerArt GmbH"),
+                          Data(vendorName="FlowerArt GmbH (styleGREEN)")) == []
+    assert _disagreements(Data(vendorName="Hoffmann Nurnberg GmbH"),
+                          Data(vendorName="Hoffmann Nürnberg GmbH")) == []
+    assert len(_disagreements(Data(vendorName="Lio Technologies GmbH"),
+                              Data(vendorName="FlowerArt GmbH"))) == 1
+
+
+def test_extraction_survives_missing_vat_id(monkeypatch):
+    """A quote without a VAT ID (Hoffmann) used to fail the whole extraction. Now both
+    passes run, neither finds one, and it's reported as missing."""
+    no_vat = {**COMPLETE_REPLY, "vendorName": "Hoffmann Nurnberg GmbH", "vatId": None}
+    token = _use_fake_openai(monkeypatch, no_vat, no_vat, pdf_text="Angebot ANG-HN-2026-041 ...")
+
+    body = _upload_for_extraction(token)
+
+    assert body["success"] is True, body
+    assert len(FakeOpenAI.requests) == 2
     assert body["data"]["vatId"] is None
     assert "VAT ID" in body["missingFields"]
+
+
+def test_extraction_scanned_pdf_goes_straight_to_pdf(monkeypatch):
+    """No text layer (a scan): skip the text pass and send the PDF right away."""
+    token = _use_fake_openai(monkeypatch, COMPLETE_REPLY, pdf_text="")
+
+    body = _upload_for_extraction(token)
+
+    assert body["success"] is True, body
+    assert len(FakeOpenAI.requests) == 1
+    assert _sent_pdf(FakeOpenAI.requests[0])
 
 
 def test_commodity_groups_expanded():

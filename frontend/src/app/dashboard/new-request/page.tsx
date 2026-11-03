@@ -2,7 +2,6 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { useMutation } from '@tanstack/react-query';
 import * as api from '@/lib/api';
 import { useCommodityGroups } from '@/lib/hooks/useCommodityGroups';
 import { Button, Input, Alert, Loader } from '@/components/base';
@@ -36,17 +35,6 @@ export default function NewRequestPage() {
   const [warning, setWarning] = useState('');
   const [extracting, setExtracting] = useState(false);
 
-  // PDF parsing mutation
-  const parsePDFMutation = useMutation({
-    mutationFn: async (file: File) => {
-      const result = await api.pdf.parse(file);
-      if (!result.text) {
-        throw new Error('Failed to parse PDF');
-      }
-      return result.text;
-    },
-  });
-
   // Handle file upload and extraction
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const uploadedFile = e.target.files?.[0];
@@ -64,11 +52,8 @@ export default function NewRequestPage() {
     setExtracting(true);
 
     try {
-      // Step 1: Parse PDF
-      const pdfText = await parsePDFMutation.mutateAsync(uploadedFile);
-
-      // Step 2: Extract structured data AND classify commodity group in one AI call
-      const extractionResult = await api.extraction.extract(pdfText);
+      // Send the PDF itself; the backend reads it and classifies the commodity group.
+      const extractionResult = await api.extraction.extract(uploadedFile);
       
       if (!extractionResult.success || !extractionResult.data) {
         throw new Error(extractionResult.error || 'Failed to extract data');
@@ -76,7 +61,7 @@ export default function NewRequestPage() {
 
       const extracted = extractionResult.data;
 
-      // Step 3: Auto-fill form (including commodity group from extraction)
+      // Auto-fill form (including commodity group from extraction)
       setTitle(extracted.title || '');
       setVendorName(extracted.vendorName || '');
       setVatId(extracted.vatId || '');
@@ -89,11 +74,16 @@ export default function NewRequestPage() {
         setCommodityGroupId(extracted.commodityGroupId);
       }
 
-      // Show warnings for missing fields
+      // Show warnings for missing fields and for values the text and PDF readings disagreed on
+      const notes: string[] = [];
       if (extractionResult.missingFields && extractionResult.missingFields.length > 0) {
-        setWarning(
-          `⚠️ Could not extract: ${extractionResult.missingFields.join(', ')}. Please fill in these fields manually.`
+        notes.push(
+          `Could not extract: ${extractionResult.missingFields.join(', ')}. Please fill in these fields manually.`
         );
+      }
+      notes.push(...(extractionResult.warnings ?? []));
+      if (notes.length > 0) {
+        setWarning(`⚠️ ${notes.join(' ')}`);
       }
 
       setSuccess('✓ PDF extracted successfully! Review and submit.');
