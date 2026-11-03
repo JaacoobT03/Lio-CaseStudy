@@ -638,14 +638,24 @@ def test_number_checks_flag_what_does_not_add_up():
                        extraCosts=[{"label": "Versandkosten", "amount": 113.85}],
                        netTotal=1299.99, vatAmount=247.00, grossTotal=1546.99)
     assert _check_numbers(style_green) == []
-    # The run that read the net total as 1,300.00: it matches neither the lines + extra
-    # costs (1,299.99) nor gross - VAT (1,546.99 - 247.00), so both checks fire.
-    assert len(_check_numbers(style_green.model_copy(update={"net_total": 1300.00}))) == 2
-    # The Apple run that read the net without the levy: neither sum matches.
+    # Misread net totals, while lines + extra costs + VAT still give the printed gross: the
+    # quote confirms what we save, so no warning. styleGREEN read as 1,300.00; Apple without
+    # the levy; Dream in Green's "Positionen netto" (before shipping).
+    assert _check_numbers(style_green.model_copy(update={"net_total": 1300.00})) == []
     apple = Data(orderLines=[line(1, 1467.61, 1467.61)],
                  extraCosts=[{"label": "Urheberrechtsabgabe", "amount": 10.55}],
                  netTotal=1467.61, vatAmount=280.85, grossTotal=1759.01)
-    assert len(_check_numbers(apple)) == 2
+    assert _check_numbers(apple) == []
+    dream_in_green = Data(orderLines=[line(1, 715.26, 715.26), line(1, 622, 622)],
+                          extraCosts=[{"label": "Versandkosten", "amount": 215}],
+                          netTotal=1337.26, vatAmount=294.93, grossTotal=1847.19)
+    assert _check_numbers(dream_in_green) == []
+    # A misread line (350 read as 530) is still caught: net and gross agree, the lines don't.
+    misread_line = Data(orderLines=[line(1.28, 559, 715.52), line(4.8, 25.13, 120.62), line(1, 530, 530)],
+                        extraCosts=[{"label": "Versandkosten", "amount": 113.85}],
+                        netTotal=1299.99, vatAmount=247.00, grossTotal=1546.99)
+    warnings = _check_numbers(misread_line)
+    assert len(warnings) == 1 and warnings[0].startswith("The lines and extra costs add up to €1,479.99")
     # A line that doesn't multiply out (list price instead of the discounted one).
     assert _check_numbers(Data(orderLines=[line(1, 894.08, 715.26)]))[0].startswith("Pos. 1:")
 

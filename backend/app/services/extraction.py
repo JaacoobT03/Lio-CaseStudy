@@ -183,6 +183,13 @@ def _check_numbers(data: ExtractedVendorData) -> list[str]:
                 f"but the quote says {line.total_price:.2f}. Please check quantity, price or discount."
             )
     lines_and_extras = sum(line.total_price for line in bought) + sum(cost.amount for cost in data.extra_costs)
+    # What we save is the lines and extra costs. If adding the VAT gives the printed gross, the
+    # quote itself confirms them, and a different "net" reading is just a subtotal the model
+    # picked (e.g. Dream in Green's "Positionen netto", before shipping).
+    if None not in (data.vat_amount, data.gross_total) and (
+        _cents(lines_and_extras + data.vat_amount) == _cents(data.gross_total)
+    ):
+        return warnings
     if data.net_total is not None and _cents(lines_and_extras) != _cents(data.net_total):
         warnings.append(
             f"The lines and extra costs add up to €{lines_and_extras:,.2f}, "
