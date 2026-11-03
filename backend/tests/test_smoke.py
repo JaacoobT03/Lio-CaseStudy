@@ -622,6 +622,34 @@ def test_same_vendor_spelled_differently_is_not_flagged():
                               Data(vendorName="FlowerArt GmbH"))) == 1
 
 
+def test_number_checks_flag_what_does_not_add_up():
+    """A quote states its numbers more than once, so code can check the model's reading.
+    The numbers are from real eval runs."""
+    from app.schemas.extraction import ExtractedVendorData as Data
+    from app.services.extraction import _check_numbers
+
+    def line(amount, unit_price, total):
+        return {"positionDescription": "x", "amount": amount, "unit": "piece",
+                "unitPrice": unit_price, "totalPrice": total, "isAlternative": False}
+
+    # styleGREEN read correctly: lines + shipping = net, net + VAT = gross.
+    # (4.8 x 25.13 = 120.624 is printed as 120.62: rounding is fine.)
+    style_green = Data(orderLines=[line(1.28, 559, 715.52), line(4.8, 25.13, 120.62), line(1, 350, 350)],
+                       extraCosts=[{"label": "Versandkosten", "amount": 113.85}],
+                       netTotal=1299.99, vatAmount=247.00, grossTotal=1546.99)
+    assert _check_numbers(style_green) == []
+    # The run that read the net total as 1,300.00: it matches neither the lines + extra
+    # costs (1,299.99) nor gross - VAT (1,546.99 - 247.00), so both checks fire.
+    assert len(_check_numbers(style_green.model_copy(update={"net_total": 1300.00}))) == 2
+    # The Apple run that read the net without the levy: neither sum matches.
+    apple = Data(orderLines=[line(1, 1467.61, 1467.61)],
+                 extraCosts=[{"label": "Urheberrechtsabgabe", "amount": 10.55}],
+                 netTotal=1467.61, vatAmount=280.85, grossTotal=1759.01)
+    assert len(_check_numbers(apple)) == 2
+    # A line that doesn't multiply out (list price instead of the discounted one).
+    assert _check_numbers(Data(orderLines=[line(1, 894.08, 715.26)]))[0].startswith("Pos. 1:")
+
+
 def test_extraction_survives_missing_vat_id(monkeypatch):
     """A quote without a VAT ID (Hoffmann) used to fail the whole extraction. Now both
     passes run, neither finds one, and it's reported as missing."""

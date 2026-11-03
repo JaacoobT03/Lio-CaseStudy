@@ -162,6 +162,39 @@ def _disagreements(from_text: ExtractedVendorData, from_pdf: ExtractedVendorData
     return warnings
 
 
+def _cents(amount: float) -> int:
+    return round(amount * 100)
+
+
+def _check_numbers(data: ExtractedVendorData) -> list[str]:
+    """Warnings where the extracted numbers don't add up. A quote states its numbers
+    more than once (line totals, net, VAT, gross), so code can check the model's reading."""
+    warnings = []
+    bought = [line for line in data.order_lines if not line.is_alternative]
+    for number, line in enumerate(bought, start=1):
+        expected = line.amount * line.unit_price
+        # Allow a cent, or half a cent per unit: vendors calculate with unrounded unit prices.
+        if abs(_cents(expected) - _cents(line.total_price)) > max(1, line.amount / 2):
+            warnings.append(
+                f"Pos. {line.position or number}: {line.amount:g} × {line.unit_price:.2f} = {expected:.2f}, "
+                f"but the quote says {line.total_price:.2f}. Please check quantity, price or discount."
+            )
+    lines_and_extras = sum(line.total_price for line in bought) + sum(cost.amount for cost in data.extra_costs)
+    if data.net_total is not None and _cents(lines_and_extras) != _cents(data.net_total):
+        warnings.append(
+            f"The lines and extra costs add up to €{lines_and_extras:,.2f}, "
+            f"but the quote's net total is €{data.net_total:,.2f}."
+        )
+    if None not in (data.net_total, data.vat_amount, data.gross_total) and (
+        _cents(data.net_total + data.vat_amount) != _cents(data.gross_total)
+    ):
+        warnings.append(
+            f"Net €{data.net_total:,.2f} + VAT €{data.vat_amount:,.2f} = "
+            f"€{data.net_total + data.vat_amount:,.2f}, but the quote's gross total is €{data.gross_total:,.2f}."
+        )
+    return warnings
+
+
 def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> ExtractionResponse:
     """Extract vendor data from a quote PDF and classify its commodity group.
 
@@ -211,7 +244,8 @@ def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> Extract
         missing_fields = _missing_fields(from_text, valid_group_ids)
         if not KEY_FIELDS.intersection(missing_fields):
             return ExtractionResponse(
-                success=True, data=from_text, missing_fields=missing_fields or None
+                success=True, data=from_text, missing_fields=missing_fields or None,
+                warnings=_check_numbers(from_text) or None,
             )
         scanned_because = f"{', '.join(sorted(KEY_FIELDS.intersection(missing_fields)))} not found in the text"
         logger.info("Missing after the text pass: %s -> reading the PDF itself", ", ".join(missing_fields))
@@ -227,7 +261,8 @@ def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> Extract
             return ExtractionResponse(success=False, error=str(exc))
         # Keep what the text pass found rather than losing everything.
         return ExtractionResponse(
-            success=True, data=from_text, missing_fields=missing_fields or None
+            success=True, data=from_text, missing_fields=missing_fields or None,
+            warnings=_check_numbers(from_text) or None,
         )
 
     warnings: list[str] = []
@@ -235,6 +270,7 @@ def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> Extract
         warnings = _disagreements(from_text, from_pdf)
         _fill_gaps(from_pdf, from_text)
     missing_fields = _missing_fields(from_pdf, valid_group_ids)
+    warnings += _check_numbers(from_pdf)
     return ExtractionResponse(
         success=True,
         data=from_pdf,
