@@ -162,6 +162,9 @@ def seed_acme_customizations(db: Session, acme: Organization) -> int:
     if "classification_rules" not in (acme.settings or {}):
         acme.settings = {**(acme.settings or {}), "classification_rules": ACME_BOOKING_RULES}
         created += 1
+    if "auto_approve_below" not in (acme.settings or {}):
+        acme.settings = {**(acme.settings or {}), "auto_approve_below": 2000}  # no approval below €2,000 net
+        created += 1
     return created
 
 

@@ -36,6 +36,8 @@ class OrganizationSettings(BaseModel):
 
     required_fields: list[ConfigurableRequiredField] = Field(default_factory=list)
     classification_rules: list[ClassificationRule] = Field(default_factory=list)
+    # Requests with a net amount below this are approved automatically; None = all need approval.
+    auto_approve_below: float | None = Field(default=None, ge=0)
 
 
 class OrganizationCreate(BaseModel):

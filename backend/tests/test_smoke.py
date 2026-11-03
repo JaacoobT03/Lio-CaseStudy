@@ -420,9 +420,9 @@ def test_activity_log_and_document():
     payload = {
         "requestorName": "Alex Admin", "titleShortDescription": "Chairs",
         "vendorName": "FurnitureCo", "vatId": "DE1", "commodityGroupId": 15,
-        "totalCost": 500.0, "department": "Ops",
+        "totalCost": 5000.0, "department": "Ops",  # above Acme's auto-approval limit
         "orderLines": [
-            {"positionDescription": "Chair", "unitPrice": 250, "amount": 2, "unit": "pc", "totalPrice": 500}
+            {"positionDescription": "Chair", "unitPrice": 2500, "amount": 2, "unit": "pc", "totalPrice": 5000}
         ],
     }
     rid = client.post("/requests", json=payload, headers=_auth(admin)).json()["id"]
@@ -430,14 +430,14 @@ def test_activity_log_and_document():
     # edit two fields -> one 'updated' activity naming those fields
     updated = dict(payload)
     updated["title"] = "Office Chairs"
-    updated["totalCost"] = 600.0
+    updated["totalCost"] = 6000.0
     updated["orderLines"] = [
-        {"positionDescription": "Chair", "unitPrice": 300, "amount": 2, "unit": "pc", "totalPrice": 600}
+        {"positionDescription": "Chair", "unitPrice": 3000, "amount": 2, "unit": "pc", "totalPrice": 6000}
     ]
     # RequestUpdate uses "title" (not titleShortDescription)
     updated = {
         "requestorName": "Alex Admin", "title": "Office Chairs", "vendorName": "FurnitureCo",
-        "vatId": "DE1", "commodityGroupId": 15, "totalCost": 600.0, "department": "Ops",
+        "vatId": "DE1", "commodityGroupId": 15, "totalCost": 6000.0, "department": "Ops",
         "orderLines": updated["orderLines"],
     }
     r = client.put(f"/requests/{rid}", json=updated, headers=_auth(admin))
@@ -713,6 +713,59 @@ def test_extraction_applies_the_booking_rule(monkeypatch):
 
     assert body["data"]["commodityGroupId"] == 11
     assert body["classificationNote"] == "booking rule 'Cable ties' (Facility Management › Electrical Engineering)"
+
+
+def test_auto_approval_below_limit():
+    """Acme approves requests below €2,000 net automatically. More money after an approval
+    (automatic or by a person) needs a new decision; BMW has no limit."""
+    requester, buyer = _signin("requester@acme.com"), _signin("buyer@acme.com")
+
+    def payload(unit_price, amount=1, total=None):
+        line_total = unit_price * amount
+        return {
+            "requestorName": "Rene Requester", "vendorName": "V",
+            "titleShortDescription": "Test", "title": "Test",  # create and edit name it differently
+            "vatId": "DE1", "commodityGroupId": 31, "department": "IT",
+            "totalCost": line_total if total is None else total,
+            "orderLines": [{"positionDescription": "Item", "unitPrice": unit_price, "amount": amount,
+                            "unit": "piece", "totalPrice": line_total if total is None else total}],
+        }
+
+    def create(body, token=requester):
+        r = client.post("/requests", json=body, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    def edit(request_id, body):
+        r = client.put(f"/requests/{request_id}", json=body, headers=_auth(requester))
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    small = create(payload(1500))
+    assert small["approval_status"] == "approved" and small["approved_by"] is None
+    activity = client.get(f"/requests/{small['id']}/activity", headers=_auth(requester)).json()
+    assert "approved automatically" in activity[0]["summary"]
+
+    assert create(payload(2000))["approval_status"] == "pending"  # "below" means below
+    # A client claiming €100 for 3 x €1,000 doesn't get past the limit.
+    assert create(payload(1000, amount=3, total=100))["approval_status"] == "pending"
+
+    # Edited above the limit: back to pending. Edited below again: approved automatically.
+    assert edit(small["id"], payload(2500))["approval_status"] == "pending"
+    assert edit(small["id"], payload(1800))["approval_status"] == "approved"
+
+    # Approved by a buyer, then the amount goes up: the approval no longer covers it.
+    large = create(payload(4200))
+    r = client.patch(f"/requests/{large['id']}/approval", json={"decision": "approved"}, headers=_auth(buyer))
+    assert r.json()["approval_status"] == "approved"
+    assert edit(large["id"], payload(4500))["approval_status"] == "pending"
+
+    # BMW has no limit: everything needs approval.
+    assert create(payload(1500), token=_signin("admin@bmw.com"))["approval_status"] == "pending"
+
+    # Admins set the limit on the organization page; a negative limit is rejected.
+    admin = _auth(_signin("admin@acme.com"))
+    assert client.patch("/organizations/me/settings", json={"auto_approve_below": -1}, headers=admin).status_code == 422
 
 
 def test_catalog_suggestions(monkeypatch):
@@ -1019,7 +1072,7 @@ def test_org_settings_required_fields():
     # Default settings: nothing extra required.
     r = client.get("/organizations/me/settings", headers=_auth(token))
     assert r.status_code == 200
-    assert r.json() == {"required_fields": [], "classification_rules": []}
+    assert r.json() == {"required_fields": [], "classification_rules": [], "auto_approve_below": None}
 
     base_payload = {
         "requestorName": "S", "titleShortDescription": "T", "vendorName": "V",

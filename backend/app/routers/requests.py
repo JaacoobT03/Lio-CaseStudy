@@ -115,6 +115,26 @@ def _log_activity(
     )
 
 
+def _amount(request: ProcurementRequest) -> float:
+    """The higher of the stated total and the lines' own maths (quantity x unit price), so
+    lowering either number can't slip a request under the approval limit."""
+    lines = sum(float(line.unit_price) * float(line.amount) for line in request.order_lines)
+    return max(float(request.total_cost), lines)
+
+
+def _approve_if_below_limit(db: Session, request: ProcurementRequest, organization_id: uuid.UUID) -> str:
+    """Below the company's limit (Acme: €2,000 net) a request needs no approval.
+    Returns a note for the activity log, or "" if the rule doesn't apply."""
+    org = db.get(Organization, organization_id)
+    limit = (org.settings or {}).get("auto_approve_below") if org else None
+    if limit is None or _amount(request) >= limit:
+        return ""
+    request.approval_status = "approved"
+    request.approved_by = None  # approved by the company's rule, not by a person
+    request.approved_at = datetime.now(timezone.utc)
+    return f"approved automatically (below your company's limit of €{limit:,.0f} net)"
+
+
 def _order_lines_signature(lines) -> list[tuple]:
     return [
         (
@@ -216,7 +236,10 @@ def create_request(
     ]
     db.add(request)
     db.flush()
-    _log_activity(db, request.id, membership.user_id, "created", "Request created")
+    # One log entry: entries written together get the same timestamp and could show in the wrong order.
+    auto_approved = _approve_if_below_limit(db, request, membership.organization_id)
+    summary = f"Request created and {auto_approved}" if auto_approved else "Request created"
+    _log_activity(db, request.id, membership.user_id, "created", summary)
     db.commit()
 
     request = _get_org_request(db, request.id, membership.organization_id)
@@ -235,6 +258,7 @@ def update_request(
     _enforce_required_fields(db, membership.organization_id, payload)
 
     changed = _changed_fields(request, payload)
+    old_amount = _amount(request)
 
     request.requestor_name = payload.requestor_name
     request.title = payload.title
@@ -257,6 +281,17 @@ def update_request(
         for index, line in enumerate(payload.order_lines)
     ]
 
+    # An approval covers the amount that was approved: more money needs a new decision
+    # (by a person, or by the company's limit). A rejection stands.
+    approval_note = ""
+    new_amount = _amount(request)
+    if new_amount != old_amount:
+        if request.approval_status == "approved" and new_amount > old_amount:
+            request.approval_status, request.approved_by, request.approved_at = "pending", None, None
+            approval_note = "approval reset: the amount went up"
+        if request.approval_status == "pending":
+            approval_note = _approve_if_below_limit(db, request, membership.organization_id) or approval_note
+
     if changed:
         labels = [_FIELD_LABELS.get(f, f) for f in changed]
         _log_activity(
@@ -264,7 +299,7 @@ def update_request(
             request.id,
             membership.user_id,
             "updated",
-            f"Updated {', '.join(labels)}",
+            f"Updated {', '.join(labels)}" + (f"; {approval_note}" if approval_note else ""),
             {"changed_fields": changed},
         )
     db.commit()
