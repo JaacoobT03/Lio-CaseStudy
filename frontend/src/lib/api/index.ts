@@ -111,6 +111,7 @@ export interface ExtractionResponse {
   missingFields?: string[];
   warnings?: string[];
   scannedBecause?: string | null;
+  classificationNote?: string | null;
 }
 
 export interface Supplier {

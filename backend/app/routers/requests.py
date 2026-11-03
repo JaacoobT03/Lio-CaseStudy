@@ -70,8 +70,12 @@ def _get_org_request(
     return request
 
 
-def _validate_commodity_group(db: Session, commodity_group_id: int) -> None:
-    if db.get(CommodityGroup, commodity_group_id) is None:
+def _validate_commodity_group(
+    db: Session, commodity_group_id: int, organization_id: uuid.UUID
+) -> None:
+    group = db.get(CommodityGroup, commodity_group_id)
+    # Another organization's own group is treated exactly like an unknown id.
+    if group is None or group.organization_id not in (None, organization_id):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Unknown commodity group id: {commodity_group_id}",
@@ -181,7 +185,7 @@ def create_request(
     membership: OrganizationMember = Depends(get_current_membership),
     db: Session = Depends(get_db),
 ) -> RequestOut:
-    _validate_commodity_group(db, payload.commodity_group_id)
+    _validate_commodity_group(db, payload.commodity_group_id, membership.organization_id)
     _enforce_required_fields(db, membership.organization_id, payload)
 
     # Vendor fields are already cleaned up during extraction, so we can persist
@@ -227,7 +231,7 @@ def update_request(
     db: Session = Depends(get_db),
 ) -> RequestOut:
     request = _get_org_request(db, request_id, membership.organization_id)
-    _validate_commodity_group(db, payload.commodity_group_id)
+    _validate_commodity_group(db, payload.commodity_group_id, membership.organization_id)
     _enforce_required_fields(db, membership.organization_id, payload)
 
     changed = _changed_fields(request, payload)

@@ -3,14 +3,17 @@ import logging
 import re
 import time
 import unicodedata
+import uuid
 
 from openai import OpenAI
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models import CommodityGroup
+from app.models import CommodityGroup, Organization
 from app.schemas.extraction import ExtractedVendorData, ExtractionResponse
+from app.schemas.organizations import OrganizationSettings
+from app.services.classification import match_rule, visible_to
 from app.services.pdf import extract_text
 
 logger = logging.getLogger(__name__)
@@ -195,13 +198,28 @@ def _check_numbers(data: ExtractedVendorData) -> list[str]:
     return warnings
 
 
-def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> ExtractionResponse:
+def _apply_booking_rule(data: ExtractedVendorData, rules, groups_by_id: dict) -> str | None:
+    """Pre-select the group of the company's booking rule that matches, if any, and
+    return a note for the user (who can still pick another group)."""
+    bought = [(line.position_description, line.total_price) for line in data.order_lines if not line.is_alternative]
+    rule = match_rule(rules, bought)
+    if rule is None or rule.commodity_group_id not in groups_by_id:
+        return None
+    group = groups_by_id[rule.commodity_group_id]
+    data.commodity_group_id, data.commodity_group_name = group.id, group.name
+    return f"booking rule '{rule.name}' ({group.category} › {group.name})"
+
+
+def extract_vendor_data(
+    pdf_bytes: bytes, filename: str, organization_id: uuid.UUID | None, db: Session
+) -> ExtractionResponse:
     """Extract vendor data from a quote PDF and classify its commodity group.
 
     Pass 1 gives the model the PDF's text (cheap). Only if a key field is still
     missing does pass 2 give it the PDF itself (text + page images). When both
     passes ran, the PDF reading wins, pass 1 fills its gaps, and fields the two
-    read differently are reported as warnings.
+    read differently are reported as warnings. Finally the organization's booking
+    rules may pre-select a different commodity group.
     """
     if not pdf_bytes:
         return ExtractionResponse(success=False, error="The uploaded file is empty")
@@ -212,23 +230,39 @@ def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> Extract
             error="OPENAI_API_KEY is not configured on the server",
         )
 
-    commodity_groups = list(
-        db.scalars(select(CommodityGroup).order_by(CommodityGroup.id))
-    )
+    # The shared groups plus the organization's own. Generated variants such as
+    # "Toner Cartridges — Pallet" can't be told apart from a quote, so the model only
+    # gets the base groups (~380 instead of ~2,000); users can still pick any group.
+    commodity_groups = [
+        g for g in db.scalars(select(CommodityGroup).where(visible_to(organization_id)).order_by(CommodityGroup.id))
+        if " — " not in g.name
+    ]
     if not commodity_groups:
         return ExtractionResponse(
             success=False,
             error="Failed to load commodity groups for classification",
         )
-
-    # Give the model the full commodity catalog so it has complete context to
-    # pick the most accurate match in a single pass.
     commodity_groups_list = "\n".join(
         f"{g.id} | {g.category} | {g.name}" for g in commodity_groups
     )
-    valid_group_ids = {g.id for g in commodity_groups}
+    groups_by_id = {g.id: g for g in commodity_groups}
+    organization = db.get(Organization, organization_id) if organization_id else None
+    rules = OrganizationSettings(**(organization.settings or {})).classification_rules if organization else []
     # Fail after a minute instead of the library's default of 10 minutes per attempt.
     client = OpenAI(api_key=settings.openai_api_key, timeout=60, max_retries=1)
+
+    def respond(data: ExtractedVendorData, warnings: list[str], scanned_because: str | None) -> ExtractionResponse:
+        """The successful answer: booking rule, missing fields and number checks."""
+        classification_note = _apply_booking_rule(data, rules, groups_by_id)
+        missing_fields = _missing_fields(data, set(groups_by_id))
+        return ExtractionResponse(
+            success=True,
+            data=data,
+            missing_fields=missing_fields or None,
+            warnings=[*warnings, *_check_numbers(data)] or None,
+            scanned_because=scanned_because,
+            classification_note=classification_note,
+        )
 
     # Pass 1: the PDF's text layer. Skipped if there is none (e.g. a scanned PDF).
     from_text = None
@@ -241,13 +275,11 @@ def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> Extract
 
     scanned_because = "the PDF has no readable text"
     if from_text is not None:
-        missing_fields = _missing_fields(from_text, valid_group_ids)
-        if not KEY_FIELDS.intersection(missing_fields):
-            return ExtractionResponse(
-                success=True, data=from_text, missing_fields=missing_fields or None,
-                warnings=_check_numbers(from_text) or None,
-            )
-        scanned_because = f"{', '.join(sorted(KEY_FIELDS.intersection(missing_fields)))} not found in the text"
+        missing_fields = _missing_fields(from_text, set(groups_by_id))
+        missing_key_fields = KEY_FIELDS.intersection(missing_fields)
+        if not missing_key_fields:
+            return respond(from_text, [], None)
+        scanned_because = f"{', '.join(sorted(missing_key_fields))} not found in the text"
         logger.info("Missing after the text pass: %s -> reading the PDF itself", ", ".join(missing_fields))
 
     # Pass 2: the PDF itself.
@@ -260,21 +292,10 @@ def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> Extract
         if from_text is None:
             return ExtractionResponse(success=False, error=str(exc))
         # Keep what the text pass found rather than losing everything.
-        return ExtractionResponse(
-            success=True, data=from_text, missing_fields=missing_fields or None,
-            warnings=_check_numbers(from_text) or None,
-        )
+        return respond(from_text, [], None)
 
     warnings: list[str] = []
     if from_text is not None:
         warnings = _disagreements(from_text, from_pdf)
         _fill_gaps(from_pdf, from_text)
-    missing_fields = _missing_fields(from_pdf, valid_group_ids)
-    warnings += _check_numbers(from_pdf)
-    return ExtractionResponse(
-        success=True,
-        data=from_pdf,
-        missing_fields=missing_fields or None,
-        warnings=warnings or None,
-        scanned_because=scanned_because,
-    )
+    return respond(from_pdf, warnings, scanned_because)

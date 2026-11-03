@@ -55,3 +55,5 @@ class ExtractionResponse(BaseModel):
     warnings: list[str] | None = None
     # Why the PDF pages were scanned (None = the text was enough), shown to the user.
     scanned_because: str | None = Field(default=None, alias="scannedBecause")
+    # Set when one of the organization's booking rules chose the commodity group.
+    classification_note: str | None = Field(default=None, alias="classificationNote")

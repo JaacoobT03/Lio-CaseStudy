@@ -27,6 +27,7 @@ export default function NewRequestPage() {
   const [vatId, setVatId] = useState('');
   const [department, setDepartment] = useState('');
   const [commodityGroupId, setCommodityGroupId] = useState<number | null>(null);
+  const [classificationNote, setClassificationNote] = useState<string | null>(null);
   const [orderLines, setOrderLines] = useState<OrderLine[]>([]);
   const [alternatives, setAlternatives] = useState<OrderLine[]>([]);
   const [totalCost, setTotalCost] = useState<number>(0);
@@ -101,6 +102,7 @@ export default function NewRequestPage() {
       if (extracted.commodityGroupId) {
         setCommodityGroupId(extracted.commodityGroupId);
       }
+      setClassificationNote(extractionResult.classificationNote ?? null);
 
       // Show warnings for missing fields and for values the text and PDF readings disagreed on
       const notes: string[] = [];
@@ -397,6 +399,11 @@ export default function NewRequestPage() {
                 </option>
               ))}
             </select>
+            {classificationNote && (
+              <p className="mt-1.5 text-sm text-ink/45">
+                Pre-selected by your company&apos;s {classificationNote}. You can still change it.
+              </p>
+            )}
           </div>
         </div>
 

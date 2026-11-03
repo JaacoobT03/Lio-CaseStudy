@@ -12,7 +12,10 @@ import json
 import logging
 from pathlib import Path
 
+from sqlalchemy import select
+
 from app.db.session import SessionLocal
+from app.models import Organization
 from app.services.extraction import extract_vendor_data
 from evals.score import GROUND_TRUTH, main as print_scores
 
@@ -21,12 +24,13 @@ def run(quotes_dir: Path, runs: int) -> dict[str, list]:
     files = [quote["file"] for quote in json.loads(GROUND_TRUTH.read_text(encoding="utf-8"))["quotes"]]
     results: dict[str, list] = {}
     with SessionLocal() as db:
+        acme = db.scalar(select(Organization).where(Organization.slug == "acme"))  # the quotes are Acme's
         for file in files:
             # The same input the upload sends: the PDF file.
             pdf_bytes = (quotes_dir / file).read_bytes()
             results[file] = []
             for i in range(runs):
-                response = extract_vendor_data(pdf_bytes, file, db)
+                response = extract_vendor_data(pdf_bytes, file, acme.id, db)
                 status = "ok" if response.success else f"FAILED: {response.error}"
                 print(f"{file[:45]:<46} run {i + 1}: {status[:90]} | missing: {response.missing_fields}"
                       f" | warnings: {response.warnings}")

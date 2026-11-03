@@ -650,6 +650,71 @@ def test_number_checks_flag_what_does_not_add_up():
     assert _check_numbers(Data(orderLines=[line(1, 894.08, 715.26)]))[0].startswith("Pos. 1:")
 
 
+def test_booking_rules_match_lines_by_value():
+    """Acme's booking rules (as seeded): keywords in either language, judged by the
+    lines that make up most of the net value, and the "small" limit."""
+    from app.schemas.organizations import ClassificationRule
+    from app.seed import ACME_BOOKING_RULES
+    from app.services.classification import match_rule
+
+    rules = [ClassificationRule(**rule) for rule in ACME_BOOKING_RULES]
+    name = lambda lines: (match_rule(rules, lines) or SimpleNamespace(name=None)).name  # noqa: E731
+
+    assert name([("Kabelbinder 200 mm schwarz, 1000 Stk.", 49.0)]) == "Cable ties"
+    assert name([("Cable ties UV-resistant, pack of 100", 12.5)]) == "Cable ties"
+    assert name([("Toner cartridge black HP 305A", 89.0)]) == "Printer toner"
+    assert name([("Figma software subscription, 12 months", 540.0)]) == "Small software subscriptions"
+    assert name([("Enterprise software subscription", 5000.0)]) is None  # not "small"
+    # €20 of cable ties inside a €10,000 machine order don't make it a cable-tie order.
+    assert name([("Kabelbinder", 20.0), ("CNC machine", 10000.0)]) is None
+    assert name([("Moosbild mit Logo", 1438.0)]) is None
+
+
+def test_acme_office_supplies_group_is_acme_only():
+    """Acme's own "Office Supplies" group: Acme sees it and can use it; BMW can do neither."""
+    acme, bmw = _signin("requester@acme.com"), _signin("admin@bmw.com")
+
+    def group_ids(token):
+        return {g["id"] for g in client.get("/commodity-groups", headers=_auth(token)).json()}
+
+    assert 100001 in group_ids(acme)
+    assert 100001 not in group_ids(bmw)
+
+    request = {"requestorName": "R", "titleShortDescription": "Figma", "vendorName": "Figma Inc.",
+               "commodityGroupId": 100001, "totalCost": 540.0,
+               "orderLines": [{"positionDescription": "Figma subscription", "unitPrice": 540.0,
+                               "amount": 1, "unit": "year", "totalPrice": 540.0}]}
+    assert client.post("/requests", json=request, headers=_auth(acme)).status_code == 201
+    assert client.post("/requests", json=request, headers=_auth(bmw)).status_code == 422
+
+
+def test_saving_one_setting_keeps_the_others():
+    """Saving "required fields" used to replace the whole settings object, which
+    would have wiped Acme's booking rules."""
+    admin = _signin("admin@acme.com")
+    r = client.patch("/organizations/me/settings", json={"required_fields": ["vat_id"]}, headers=_auth(admin))
+    assert r.status_code == 200, r.text
+    settings = client.get("/organizations/me/settings", headers=_auth(admin)).json()
+    assert settings["required_fields"] == ["vat_id"]
+    assert len(settings["classification_rules"]) == 3
+    # restore
+    client.patch("/organizations/me/settings", json={"required_fields": []}, headers=_auth(admin))
+
+
+def test_extraction_applies_the_booking_rule(monkeypatch):
+    """The AI files cable ties under Consumables; Acme's rule pre-selects Electrical
+    Engineering and says so."""
+    cable_ties = {**COMPLETE_REPLY, "commodityGroupId": 49, "commodityGroupName": "Consumables",
+                  "orderLines": [{**COMPLETE_REPLY["orderLines"][0],
+                                  "positionDescription": "Kabelbinder 200 mm, 1000 Stk."}]}
+    _use_fake_openai(monkeypatch, cable_ties, pdf_text="Angebot Kabelbinder ...")
+
+    body = _upload_for_extraction(_signin("requester@acme.com"))
+
+    assert body["data"]["commodityGroupId"] == 11
+    assert body["classificationNote"] == "booking rule 'Cable ties' (Facility Management › Electrical Engineering)"
+
+
 def test_extraction_survives_missing_vat_id(monkeypatch):
     """A quote without a VAT ID (Hoffmann) used to fail the whole extraction. Now both
     passes run, neither finds one, and it's reported as missing."""
@@ -909,7 +974,7 @@ def test_org_settings_required_fields():
     # Default settings: nothing extra required.
     r = client.get("/organizations/me/settings", headers=_auth(token))
     assert r.status_code == 200
-    assert r.json() == {"required_fields": []}
+    assert r.json() == {"required_fields": [], "classification_rules": []}
 
     base_payload = {
         "requestorName": "S", "titleShortDescription": "T", "vendorName": "V",
