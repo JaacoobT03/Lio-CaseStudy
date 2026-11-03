@@ -3,7 +3,9 @@
 Run with: python -m pytest tests/ -q   (or plainly: python tests/test_smoke.py)
 """
 import io
+import json
 import uuid
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
@@ -494,6 +496,52 @@ def test_extraction_without_api_key():
     # empty text
     r = client.post("/extraction", json={"text": "  "}, headers=_auth(token))
     assert r.json()["success"] is False
+
+
+class FakeOpenAI:
+    """Stands in for openai.OpenAI in tests: returns `reply` as the model's
+    answer and remembers the last request, so no real API call is made."""
+
+    reply = ""
+    last_request: dict = {}
+
+    def __init__(self, api_key=None):
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **request):
+        FakeOpenAI.last_request = request
+        message = SimpleNamespace(content=FakeOpenAI.reply, refusal=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")])
+
+
+def test_extraction_survives_missing_vat_id(monkeypatch):
+    """A quote without a VAT ID (e.g. Hoffmann) used to fail the whole
+    extraction: the model correctly answers null, the schema rejected it."""
+    from app.core.config import settings
+    from app.services import extraction
+
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(extraction, "OpenAI", FakeOpenAI)
+    FakeOpenAI.reply = json.dumps({
+        "title": "Grinding machine",
+        "vendorName": "Hoffmann Nurnberg GmbH",
+        "vatId": None,
+        "department": None,
+        "orderLines": [{"positionDescription": "Schleifmaschine HN-GS 450", "unitPrice": 15000,
+                        "amount": 1, "unit": "piece", "totalPrice": 15000}],
+        "totalCost": 15000,
+        "commodityGroupId": 45,
+        "commodityGroupName": "Production Machinery",
+    })
+
+    r = client.post("/auth/signup", json={"email": "novat@example.com", "password": "secret123"})
+    token = r.json()["access_token"]
+    r = client.post("/extraction", json={"text": "Angebot ANG-HN-2026-041"}, headers=_auth(token))
+
+    body = r.json()
+    assert body["success"] is True, body
+    assert body["data"]["vatId"] is None
+    assert "VAT ID" in body["missingFields"]
 
 
 def test_commodity_groups_expanded():

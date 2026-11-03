@@ -140,13 +140,13 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
 
     # Check which fields are missing or empty (same rules as the original).
     missing_fields: list[str] = []
-    if not extracted.title.strip():
+    if not (extracted.title or "").strip():
         missing_fields.append("Title/Short Description")
-    if not extracted.vendor_name.strip():
+    if not (extracted.vendor_name or "").strip():
         missing_fields.append("Vendor Name")
-    if not extracted.vat_id.strip():
+    if not (extracted.vat_id or "").strip():
         missing_fields.append("VAT ID")
-    if not extracted.department.strip():
+    if not (extracted.department or "").strip():
         missing_fields.append("Department")
     if not extracted.order_lines:
         missing_fields.append("Order Lines")

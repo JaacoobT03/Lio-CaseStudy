@@ -24,10 +24,12 @@ class OrderLineData(BaseModel):
 class ExtractedVendorData(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    title: str = ""
-    vendor_name: str = Field(default="", alias="vendorName")
-    vat_id: str = Field(default="", alias="vatId")
-    department: str = ""
+    # None = "not found in the document" (e.g. a quote without a VAT ID). That is
+    # a normal case, reported as a missing field, not a reason to fail.
+    title: str | None = None
+    vendor_name: str | None = Field(default=None, alias="vendorName")
+    vat_id: str | None = Field(default=None, alias="vatId")
+    department: str | None = None
     order_lines: list[OrderLineData] = Field(default_factory=list, alias="orderLines")
     total_cost: float = Field(default=0, alias="totalCost")
     commodity_group_id: int | None = Field(default=None, alias="commodityGroupId")
