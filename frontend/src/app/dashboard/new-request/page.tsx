@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import * as api from '@/lib/api';
 import { useCommodityGroups } from '@/lib/hooks/useCommodityGroups';
@@ -34,6 +34,18 @@ export default function NewRequestPage() {
   const [success, setSuccess] = useState('');
   const [warning, setWarning] = useState('');
   const [extracting, setExtracting] = useState(false);
+  const [slowExtraction, setSlowExtraction] = useState(false);
+
+  // The text pass alone took up to ~8 s in our evals. Past that, the backend may be
+  // scanning the PDF pages, so the spinner says so (without claiming it for sure).
+  useEffect(() => {
+    if (!extracting) {
+      setSlowExtraction(false);
+      return;
+    }
+    const timer = setTimeout(() => setSlowExtraction(true), 8000);
+    return () => clearTimeout(timer);
+  }, [extracting]);
 
   // Handle file upload and extraction
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -66,8 +78,20 @@ export default function NewRequestPage() {
       setVendorName(extracted.vendorName || '');
       setVatId(extracted.vatId || '');
       setDepartment(extracted.department || '');
-      setOrderLines(extracted.orderLines || []);
-      setTotalCost(extracted.totalCost || 0);
+      // Until the form can show alternatives: keep only the lines being bought, and add
+      // extra costs (shipping, fees) as lines so the total is the net total.
+      const lines = [
+        ...extracted.orderLines.filter((line) => !line.isAlternative),
+        ...extracted.extraCosts.map((cost) => ({
+          positionDescription: `${cost.label} (extra cost)`,
+          unitPrice: cost.amount,
+          amount: 1,
+          unit: 'lump sum',
+          totalPrice: cost.amount,
+        })),
+      ];
+      setOrderLines(lines);
+      setTotalCost(lines.reduce((sum, line) => sum + line.totalPrice, 0));
       
       // Set commodity group (now included in extraction)
       if (extracted.commodityGroupId) {
@@ -86,7 +110,11 @@ export default function NewRequestPage() {
         setWarning(`⚠️ ${notes.join(' ')}`);
       }
 
-      setSuccess('✓ PDF extracted successfully! Review and submit.');
+      setSuccess(
+        extractionResult.scannedBecause
+          ? `✓ Scanned the PDF pages (${extractionResult.scannedBecause}). Review and submit.`
+          : '✓ PDF extracted successfully! Review and submit.'
+      );
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
       console.error('Extraction error:', err);
@@ -224,7 +252,11 @@ export default function NewRequestPage() {
               {extracting ? (
                 <div className="flex flex-col items-center">
                   <Loader size="lg" />
-                  <p className="mt-4 text-sm text-gray-600">Extracting data from PDF...</p>
+                  <p className="mt-4 text-sm text-gray-600">
+                    {slowExtraction
+                      ? "Still working… if something wasn't in the text, we're now scanning the PDF pages."
+                      : 'Reading the quote text…'}
+                  </p>
                 </div>
               ) : file ? (
                 <div>

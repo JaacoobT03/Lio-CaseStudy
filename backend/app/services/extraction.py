@@ -1,5 +1,4 @@
 import base64
-import json
 import logging
 import re
 import time
@@ -17,15 +16,13 @@ from app.services.pdf import extract_text
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
-    "You are a data extraction and classification specialist. Always respond with "
-    "valid JSON only, no markdown or code blocks. Extract all information accurately "
-    "from German business documents and classify into the appropriate commodity "
-    "group based on the full context of the offer."
+    "You extract procurement data from German vendor quotes and classify them into "
+    "commodity groups. Report only what the document says."
 )
 
 # If any of these is still missing after reading the PDF's text, we give the
 # model the PDF itself (text + page images), e.g. for a letterhead that is an image.
-KEY_FIELDS = {"Vendor Name", "VAT ID", "Order Lines", "Total Cost"}
+KEY_FIELDS = {"Vendor Name", "VAT ID", "Order Lines", "Net Total"}
 
 # Legal forms and filler words, ignored when comparing company names.
 NAME_NOISE = {"gmbh", "mbh", "ag", "kg", "se", "co", "ltd", "inc", "und", "and"}
@@ -33,72 +30,32 @@ NAME_NOISE = {"gmbh", "mbh", "ag", "kg", "se", "co", "ltd", "inc", "und", "and"}
 
 def _build_prompt(commodity_groups_list: str, pdf_text: str | None = None) -> str:
     """The extraction prompt. With pdf_text the document is pasted in as text;
-    without it, the prompt refers to the PDF attached to the same message."""
-    if pdf_text is None:
-        source, document = "the attached PDF (a German vendor quote)", ""
-    else:
-        source, document = "the following German document text", f"Document Text:\n{pdf_text}\n\n"
-    return f"""You are a data extraction and classification specialist. Extract procurement/vendor offer information from {source} AND classify it into the appropriate commodity group.
+    without it, the prompt refers to the PDF attached to the same message.
+    Field-specific rules live in the schema's descriptions (schemas/extraction.py)."""
+    document = "The quote is the attached PDF." if pdf_text is None else f"The quote's text:\n{pdf_text}"
+    return f"""Extract a vendor's quote (German: "Angebot") so that a purchase request can be created.
+The quote was sent BY the vendor TO our company, the customer.
 
-{document}Please extract the following information:
-1. Title/Short Description (A brief summary of what this procurement is for - e.g., "Office Equipment Purchase", "Software Licenses", etc.)
-2. Vendor Name (Lieferant/Anbieter/Firma/Company name)
-3. VAT ID (Umsatzsteuer-Identifikationsnummer/VAT ID/USt-IdNr/Tax ID)
-4. Department/Customer (Abteilung/Kunde/Offered to/Customer name)
-5. Order Lines/Items (All line items with):
-   - Position Description (Bezeichnung/Product/Item/Artikel)
-   - Unit Price (Einzelpreis/Unit Price/Preis/Price per unit)
-   - Amount (Menge/Quantity/Anzahl)
-   - Unit (Einheit/Unit/ME - e.g., "licenses", "pieces", "Stück", "items")
-   - Total Price (Gesamtpreis/Total/Gesamt)
-6. Total Cost (Gesamtsumme/Total Cost/Total Offer Cost)
-7. Commodity Group Classification - Select the SINGLE most appropriate commodity group from the list below
+Rules:
+- Report only what the document says. If a value is not in it, return null. Never guess.
+- Money: plain numbers in EUR ("1.438,00" = 1438.00), always NET (before VAT), discounts applied.
+- Order lines: every numbered position that has a price, in document order. Not: headings
+  without a price, page carry-overs ("Übertrag"), adverts or recommendations.
+- Alternatives stay in the list, marked with isAlternative; they are not part of the total.
+- Extra costs: shipping, fees or levies that appear only in the summary block.
+- Units in English; keep descriptions in the document's language.
+
+{document}
+
+Commodity group: pick the SINGLE most appropriate group from the list below, considering
+the PRIMARY nature and purpose of the items:
+- Branded office decor/furniture -> Office Equipment (15)
+- Traditional promotional items (brochures, giveaways, banners) -> Promotional Materials (43)
+- Software/IT products -> Software (31) or IT Services (30)
+- If genuinely uncertain, set commodityGroupId to null.
 
 Available Commodity Groups (ID | Category | Name):
-{commodity_groups_list}
-
-IMPORTANT INSTRUCTIONS:
-- For the title, create a SHORT (2-5 words) description based on the main items being purchased
-- Extract ALL line items, even if there are many
-- For unit prices and totals, extract only the numeric value (remove currency symbols)
-- For the unit field, translate German terms to English (e.g., "Stück" -> "pieces", "Lizenzen" -> "licenses")
-- Be careful with German number formatting (e.g., "1.438,00" = 1438.00)
-- For classification, consider the PRIMARY nature and purpose of the items:
-  * Branded office decor/furniture → Office Equipment (15)
-  * Traditional promotional items (brochures, giveaways, banners) → Promotional Materials (43)
-  * Software/IT products → Software (31) or IT Services (30)
-  * If genuinely uncertain, set commodityGroupId to null
-
-Return ONLY valid JSON in this exact format (no markdown, no code blocks):
-{{
-  "title": "Short description of procurement",
-  "vendorName": "Company Name",
-  "vatId": "DE123456789",
-  "department": "Department Name",
-  "orderLines": [
-    {{
-      "positionDescription": "Item description",
-      "unitPrice": 150.00,
-      "amount": 10,
-      "unit": "licenses",
-      "totalPrice": 1500.00
-    }}
-  ],
-  "totalCost": 1500.00,
-  "commodityGroupId": 15,
-  "commodityGroupName": "Office Equipment"
-}}"""
-
-
-def _strip_markdown_fences(content: str) -> str:
-    cleaned = content.strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned.removeprefix("```json").strip()
-    elif cleaned.startswith("```"):
-        cleaned = cleaned.removeprefix("```").strip()
-    if cleaned.endswith("```"):
-        cleaned = cleaned.removesuffix("```").strip()
-    return cleaned
+{commodity_groups_list}"""
 
 
 def _pdf_message(pdf_bytes: bytes, filename: str, commodity_groups_list: str) -> list[dict]:
@@ -122,12 +79,13 @@ def _model_options() -> dict:
 def _ask_model(client: OpenAI, user_content: str | list[dict], label: str) -> ExtractedVendorData:
     """One extraction call. Raises if the reply is cut off, empty or isn't valid data."""
     started = time.monotonic()
-    response = client.responses.create(
+    response = client.responses.parse(
         model=settings.openai_model,
         instructions=SYSTEM_PROMPT,
         input=[{"role": "user", "content": user_content}],
         max_output_tokens=8000,  # includes the model's reasoning, not just the answer
         store=False,  # don't keep customer quotes on OpenAI's side
+        text_format=ExtractedVendorData,  # structured outputs: the reply must match this schema
         **_model_options(),
     )
     if response.usage:
@@ -137,10 +95,9 @@ def _ask_model(client: OpenAI, user_content: str | list[dict], label: str) -> Ex
         )
     if response.status == "incomplete":
         raise ValueError(f"The model stopped early: {response.incomplete_details}")
-    content = response.output_text
-    if not content:
-        raise ValueError("Empty response from AI")
-    return ExtractedVendorData.model_validate(json.loads(_strip_markdown_fences(content)))
+    if response.output_parsed is None:  # e.g. the model refused
+        raise ValueError("The model returned no data")
+    return response.output_parsed
 
 
 def _missing_fields(data: ExtractedVendorData, valid_group_ids: set[int]) -> list[str]:
@@ -158,12 +115,10 @@ def _missing_fields(data: ExtractedVendorData, valid_group_ids: set[int]) -> lis
         missing_fields.append("Vendor Name")
     if not (data.vat_id or "").strip():
         missing_fields.append("VAT ID")
-    if not (data.department or "").strip():
-        missing_fields.append("Department")
     if not data.order_lines:
         missing_fields.append("Order Lines")
-    if not data.total_cost:
-        missing_fields.append("Total Cost")
+    if not data.net_total:
+        missing_fields.append("Net Total")
     if not data.commodity_group_id or not data.commodity_group_name:
         missing_fields.append("Commodity Group")
     return missing_fields
@@ -200,7 +155,7 @@ def _disagreements(from_text: ExtractedVendorData, from_pdf: ExtractedVendorData
         warnings.append(warning("Vendor", text_vendor, pdf_vendor))
     for label, text_value, pdf_value in [
         ("VAT ID", from_text.vat_id, from_pdf.vat_id),
-        ("Total", from_text.total_cost, from_pdf.total_cost),
+        ("Net total", from_text.net_total, from_pdf.net_total),
     ]:
         if text_value and pdf_value and comparable(text_value) != comparable(pdf_value):
             warnings.append(warning(label, text_value, pdf_value))
@@ -239,7 +194,8 @@ def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> Extract
         f"{g.id} | {g.category} | {g.name}" for g in commodity_groups
     )
     valid_group_ids = {g.id for g in commodity_groups}
-    client = OpenAI(api_key=settings.openai_api_key)
+    # Fail after a minute instead of the library's default of 10 minutes per attempt.
+    client = OpenAI(api_key=settings.openai_api_key, timeout=60, max_retries=1)
 
     # Pass 1: the PDF's text layer. Skipped if there is none (e.g. a scanned PDF).
     from_text = None
@@ -250,12 +206,14 @@ def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> Extract
     except Exception:  # noqa: BLE001 — pass 2 still gets its chance
         logger.exception("Extraction from the PDF text failed")
 
+    scanned_because = "the PDF has no readable text"
     if from_text is not None:
         missing_fields = _missing_fields(from_text, valid_group_ids)
         if not KEY_FIELDS.intersection(missing_fields):
             return ExtractionResponse(
                 success=True, data=from_text, missing_fields=missing_fields or None
             )
+        scanned_because = f"{', '.join(sorted(KEY_FIELDS.intersection(missing_fields)))} not found in the text"
         logger.info("Missing after the text pass: %s -> reading the PDF itself", ", ".join(missing_fields))
 
     # Pass 2: the PDF itself.
@@ -282,4 +240,5 @@ def extract_vendor_data(pdf_bytes: bytes, filename: str, db: Session) -> Extract
         data=from_pdf,
         missing_fields=missing_fields or None,
         warnings=warnings or None,
+        scanned_because=scanned_because,
     )

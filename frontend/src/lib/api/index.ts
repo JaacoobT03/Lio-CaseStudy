@@ -84,13 +84,22 @@ export interface UpdateRequestInput {
   orderLines: OrderLineInput[];
 }
 
+export interface ExtractedOrderLine extends OrderLineInput {
+  position: string | null;
+  isAlternative: boolean;
+  alternativeTo: string | null;
+}
+
 export interface ExtractedVendorData {
-  title: string;
-  vendorName: string;
-  vatId: string;
-  department: string;
-  orderLines: OrderLineInput[];
-  totalCost: number;
+  title: string | null;
+  vendorName: string | null;
+  vatId: string | null;
+  department: string | null;
+  orderLines: ExtractedOrderLine[];
+  extraCosts: { label: string; amount: number }[];
+  netTotal: number | null;
+  vatAmount: number | null;
+  grossTotal: number | null;
   commodityGroupId: number | null;
   commodityGroupName: string | null;
 }
@@ -101,6 +110,7 @@ export interface ExtractionResponse {
   error?: string;
   missingFields?: string[];
   warnings?: string[];
+  scannedBecause?: string | null;
 }
 
 export interface Supplier {

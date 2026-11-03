@@ -3,7 +3,6 @@
 Run with: python -m pytest tests/ -q   (or plainly: python tests/test_smoke.py)
 """
 import io
-import json
 import uuid
 from types import SimpleNamespace
 
@@ -525,17 +524,18 @@ class FakeOpenAI:
     """Stands in for openai.OpenAI in tests: answers each call with the next
     reply from `replies` and remembers every request, so no real API call is made."""
 
-    replies: list[str] = []
+    replies: list[dict] = []
     requests: list[dict] = []
 
-    def __init__(self, api_key=None):
-        self.responses = SimpleNamespace(create=self._create)
+    def __init__(self, api_key=None, **options):
+        self.responses = SimpleNamespace(parse=self._parse)
 
-    def _create(self, **request):
+    def _parse(self, **request):
         FakeOpenAI.requests.append(request)
+        # Like the real structured-outputs call: the reply is checked against the schema.
+        parsed = request["text_format"].model_validate(FakeOpenAI.replies.pop(0))
         return SimpleNamespace(
-            output_text=FakeOpenAI.replies.pop(0), status="completed",
-            incomplete_details=None, usage=None,
+            output_parsed=parsed, status="completed", incomplete_details=None, usage=None
         )
 
 
@@ -548,7 +548,7 @@ def _use_fake_openai(monkeypatch, *replies: dict, pdf_text: str):
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
     monkeypatch.setattr(extraction, "OpenAI", FakeOpenAI)
     monkeypatch.setattr(extraction, "extract_text", lambda pdf_bytes: pdf_text)
-    FakeOpenAI.replies = [json.dumps(reply) for reply in replies]
+    FakeOpenAI.replies = list(replies)
     FakeOpenAI.requests = []
     r = client.post("/auth/signup", json={"email": f"{uuid.uuid4().hex}@example.com", "password": "secret123"})
     return r.json()["access_token"]
@@ -566,9 +566,12 @@ COMPLETE_REPLY = {
     "vendorName": "FlowerArt GmbH",
     "vatId": "DE271073640",
     "department": None,
-    "orderLines": [{"positionDescription": "Moss module", "unitPrice": 559,
-                    "amount": 1.28, "unit": "m²", "totalPrice": 715.52}],
-    "totalCost": 715.52,
+    "orderLines": [{"position": "1", "positionDescription": "Moss module", "amount": 1.28, "unit": "m²",
+                    "unitPrice": 559, "totalPrice": 715.52, "isAlternative": False, "alternativeTo": None}],
+    "extraCosts": [{"label": "Versandkosten", "amount": 113.85}],
+    "netTotal": 829.37,
+    "vatAmount": 157.58,
+    "grossTotal": 986.95,
     "commodityGroupId": 15,
     "commodityGroupName": "Office Equipment",
 }
@@ -584,6 +587,8 @@ def test_extraction_reads_text_first(monkeypatch):
     assert len(FakeOpenAI.requests) == 1
     assert not _sent_pdf(FakeOpenAI.requests[0])
     assert FakeOpenAI.requests[0]["store"] is False  # customer quotes aren't kept at OpenAI
+    assert FakeOpenAI.requests[0]["text_format"].__name__ == "ExtractedVendorData"  # structured outputs
+    assert body["scannedBecause"] is None
 
 
 def test_extraction_falls_back_to_pdf(monkeypatch):
@@ -600,6 +605,7 @@ def test_extraction_falls_back_to_pdf(monkeypatch):
     assert body["data"]["vendorName"] == "FlowerArt GmbH"
     assert body["data"]["vatId"] == "DE271073640"
     assert any("Vendor" in warning for warning in body["warnings"])
+    assert body["scannedBecause"] == "VAT ID not found in the text"
 
 
 def test_same_vendor_spelled_differently_is_not_flagged():
