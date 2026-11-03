@@ -114,8 +114,9 @@
       "net_total": 1478.16,
       "vat_amount": 280.85,
       "gross_total": 1759.01,
-      "category_ids": [29],
+      "category_ids": [29, 96],
       "notes": [
+        "Category: 29 'Information Technology > Hardware' or 96 'Information Technology > Business Laptop' (more specific, added after the gpt-6-luna run chose it). Variants such as 'Business Laptop - Mid-range' don't count: the quote doesn't say which tier.",
         "The quote has no position numbers; the single product row is treated as position 1.",
         "The levy is listed after VAT, but VAT 280.85 = 19% of (1,467.61 + 10.55), so the levy is part of the net.",
         "Vendor appears as 'Apple Business Team' with UID DE258811348; no legal entity name on the quote."
