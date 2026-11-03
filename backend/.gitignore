@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment
+.env
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Local SQLite databases (dev/test only; the app uses Postgres)
+*.db
+
+# Internal data-generation tooling (kept local, not shipped)
+scripts/generate_articles.py
