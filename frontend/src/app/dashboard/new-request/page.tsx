@@ -12,6 +12,8 @@ interface OrderLine {
   amount: number;
   unit: string;
   totalPrice: number;
+  position?: string | null; // as printed on the quote, e.g. "1.1"
+  alternativeTo?: string | null; // for alternatives: the position they replace
 }
 
 export default function NewRequestPage() {
@@ -26,6 +28,7 @@ export default function NewRequestPage() {
   const [department, setDepartment] = useState('');
   const [commodityGroupId, setCommodityGroupId] = useState<number | null>(null);
   const [orderLines, setOrderLines] = useState<OrderLine[]>([]);
+  const [alternatives, setAlternatives] = useState<OrderLine[]>([]);
   const [totalCost, setTotalCost] = useState<number>(0);
 
   // UI state
@@ -78,8 +81,8 @@ export default function NewRequestPage() {
       setVendorName(extracted.vendorName || '');
       setVatId(extracted.vatId || '');
       setDepartment(extracted.department || '');
-      // Until the form can show alternatives: keep only the lines being bought, and add
-      // extra costs (shipping, fees) as lines so the total is the net total.
+      // The lines being bought, plus extra costs (shipping, fees) as lines, so the total
+      // is the net total. Alternatives are listed separately; the user can swap one in.
       const lines = [
         ...extracted.orderLines.filter((line) => !line.isAlternative),
         ...extracted.extraCosts.map((cost) => ({
@@ -91,6 +94,7 @@ export default function NewRequestPage() {
         })),
       ];
       setOrderLines(lines);
+      setAlternatives(extracted.orderLines.filter((line) => line.isAlternative));
       setTotalCost(lines.reduce((sum, line) => sum + line.totalPrice, 0));
       
       // Set commodity group (now included in extraction)
@@ -162,6 +166,28 @@ export default function NewRequestPage() {
     setOrderLines(updated);
     const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
     setTotalCost(newTotal);
+  };
+
+  // Swap an alternative in for the line it replaces; that line becomes an alternative
+  // itself, so the user can swap back. Other alternatives to the same line follow along.
+  const swapInAlternative = (index: number) => {
+    const chosen = alternatives[index];
+    const replacedIndex = orderLines.findIndex((line) => line.position === chosen.alternativeTo);
+    const updated = [...orderLines];
+    const remaining = alternatives
+      .filter((_, i) => i !== index)
+      .map((alt) =>
+        alt.alternativeTo === chosen.alternativeTo ? { ...alt, alternativeTo: chosen.position } : alt
+      );
+    if (replacedIndex === -1) {
+      updated.push({ ...chosen, alternativeTo: null }); // what it replaced is gone: just add it
+    } else {
+      remaining.push({ ...updated[replacedIndex], alternativeTo: chosen.position });
+      updated[replacedIndex] = { ...chosen, alternativeTo: null };
+    }
+    setOrderLines(updated);
+    setAlternatives(remaining);
+    setTotalCost(updated.reduce((sum, line) => sum + line.totalPrice, 0));
   };
 
   // Submit form
@@ -457,6 +483,36 @@ export default function NewRequestPage() {
             </div>
           )}
         </div>
+
+        {/* Alternatives offered by the vendor: not in the total until swapped in */}
+        {alternatives.length > 0 && (
+          <div className="lio-card p-6">
+            <h2 className="text-xl font-semibold tracking-tight text-ink mb-1">Alternatives offered</h2>
+            <p className="text-sm text-gray-600 mb-4">
+              Not included in the total. Swap one in to buy it instead.
+            </p>
+            <div className="space-y-2">
+              {alternatives.map((alt, index) => (
+                <div
+                  key={index}
+                  className="flex items-center justify-between gap-4 border border-dashed border-gray-300 rounded-lg p-3 text-sm text-gray-600"
+                >
+                  <span>
+                    {alt.position && `Pos. ${alt.position} `}
+                    {alt.alternativeTo && `(instead of ${alt.alternativeTo}): `}
+                    {alt.positionDescription}
+                  </span>
+                  <span className="flex items-center gap-3 whitespace-nowrap">
+                    €{alt.totalPrice.toFixed(2)}
+                    <Button type="button" variant="outline" size="sm" onClick={() => swapInAlternative(index)}>
+                      Use this instead
+                    </Button>
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Total Cost */}
         <div className="bg-accent-soft/20 border-2 border-accent/40 rounded-lg p-6">
