@@ -715,6 +715,51 @@ def test_extraction_applies_the_booking_rule(monkeypatch):
     assert body["classificationNote"] == "booking rule 'Cable ties' (Facility Management › Electrical Engineering)"
 
 
+def test_catalog_suggestions(monkeypatch):
+    """The MacBook gets Acme's cheapest ultralight laptop; the grinder gets nothing;
+    no saving is claimed when the units differ; BMW (no catalog) gets nothing."""
+    from app.core.config import settings
+    from app.db.session import get_db as _get_db
+    from app.models import Organization
+    from app.services import catalog
+
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(catalog, "OpenAI", FakeOpenAI)
+    db = next(app.dependency_overrides[_get_db]())
+    acme_id = db.scalar(select(Organization.id).where(Organization.slug == "acme"))
+    items = [description for description, _ in catalog.catalog_items(acme_id, db)]
+    laptop = items.index('Business laptop 13" ultralight / 16 GB / 1 TB') + 1
+    moss_wall = items.index("Custom moss wall, preserved reindeer moss, made to measure") + 1
+
+    FakeOpenAI.requests = []
+    FakeOpenAI.replies = [{"matches": [
+        {"line": 1, "item": laptop, "match": "comparable", "reason": "Another brand of 13-inch laptop."},
+        {"line": 2, "item": None, "match": None, "reason": "No grinding machines in the catalog."},
+        {"line": 3, "item": moss_wall, "match": "same", "reason": "A preserved moss wall."},
+    ]}]
+    lines = [
+        {"positionDescription": '13" MacBook Air M2, 16 GB, 512 GB', "amount": 1, "unit": "piece", "unitPrice": 1467.61},
+        {"positionDescription": "Schleifmaschine HN-GS 450", "amount": 1, "unit": "piece", "unitPrice": 15000},
+        {"positionDescription": "Moosbild 160x80 cm", "amount": 1, "unit": "piece", "unitPrice": 1438},
+    ]
+    r = client.post("/articles/suggest", json={"lines": lines}, headers=_auth(_signin("requester@acme.com")))
+    assert r.status_code == 200, r.text
+    by_line = {s["lineIndex"]: s for s in r.json()}
+
+    assert set(by_line) == {0, 2}  # nothing for the grinder
+    offers = by_line[0]["offers"]
+    assert offers[0] == {"articleNumber": "DEL-00905", "supplierName": "Delacroix Systems GmbH",
+                         "supplierVatId": offers[0]["supplierVatId"], "unitPrice": 1438.0, "unit": "piece"}
+    assert [o["unitPrice"] for o in offers] == sorted(o["unitPrice"] for o in offers)  # cheapest first
+    assert by_line[0]["saving"] == 29.61
+    assert by_line[2]["saving"] is None  # €/m² vs. a picture priced per piece: no fake saving
+
+    # BMW has no catalog: no suggestions, and no model call at all.
+    FakeOpenAI.requests = []
+    r = client.post("/articles/suggest", json={"lines": lines}, headers=_auth(_signin("admin@bmw.com")))
+    assert r.json() == [] and FakeOpenAI.requests == []
+
+
 def test_extraction_survives_missing_vat_id(monkeypatch):
     """A quote without a VAT ID (Hoffmann) used to fail the whole extraction. Now both
     passes run, neither finds one, and it's reported as missing."""

@@ -139,6 +139,24 @@ export interface Article {
   created_at: string;
 }
 
+export interface CatalogOffer {
+  articleNumber: string;
+  supplierName: string;
+  supplierVatId: string | null;
+  unitPrice: number;
+  unit: string;
+}
+
+/** A catalog article matching one request line; offers sorted cheapest first. */
+export interface CatalogSuggestion {
+  lineIndex: number;
+  articleDescription: string;
+  match: 'same' | 'comparable';
+  reason: string;
+  offers: CatalogOffer[];
+  saving: number | null;
+}
+
 export interface ArticlePage {
   items: Article[];
   total: number;
@@ -310,6 +328,13 @@ export const suppliers = {
 // ============================================================================
 
 export const articles = {
+  /** Catalog articles (negotiated prices) matching the given request lines. */
+  suggest(
+    lines: { positionDescription: string; unitPrice: number; amount: number; unit: string }[]
+  ): Promise<CatalogSuggestion[]> {
+    return apiFetch('/articles/suggest', { body: { lines } });
+  },
+
   list(params?: {
     search?: string;
     supplierId?: string;

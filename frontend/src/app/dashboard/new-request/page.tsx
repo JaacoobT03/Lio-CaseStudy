@@ -30,6 +30,8 @@ export default function NewRequestPage() {
   const [classificationNote, setClassificationNote] = useState<string | null>(null);
   const [orderLines, setOrderLines] = useState<OrderLine[]>([]);
   const [alternatives, setAlternatives] = useState<OrderLine[]>([]);
+  const [catalogSuggestions, setCatalogSuggestions] = useState<api.CatalogSuggestion[]>([]);
+  const [checkingCatalog, setCheckingCatalog] = useState(false);
   const [totalCost, setTotalCost] = useState<number>(0);
 
   // UI state
@@ -50,6 +52,22 @@ export default function NewRequestPage() {
     const timer = setTimeout(() => setSlowExtraction(true), 8000);
     return () => clearTimeout(timer);
   }, [extracting]);
+
+  // A request opened from a catalog card ("Order from catalog instead") arrives prefilled via the link
+  useEffect(() => {
+    const prefill = new URLSearchParams(window.location.search).get('prefill');
+    if (!prefill) return;
+    const draft = JSON.parse(prefill);
+    setTitle(draft.title);
+    setRequestorName(draft.requestorName);
+    setDepartment(draft.department);
+    setCommodityGroupId(draft.commodityGroupId);
+    setVendorName(draft.vendorName);
+    setVatId(draft.vatId);
+    setOrderLines([draft.line]);
+    setTotalCost(draft.line.totalPrice);
+    setSuccess('Prefilled from your catalog. Please check the quantity and submit.');
+  }, []);
 
   // Handle file upload and extraction
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -103,6 +121,7 @@ export default function NewRequestPage() {
         setCommodityGroupId(extracted.commodityGroupId);
       }
       setClassificationNote(extractionResult.classificationNote ?? null);
+      checkCatalog(lines); // runs in the background; the cards appear when it's done
 
       // Show warnings for missing fields and for values the text and PDF readings disagreed on
       const notes: string[] = [];
@@ -162,8 +181,46 @@ export default function NewRequestPage() {
     setTotalCost(newTotal);
   };
 
+  // Ask which catalog articles (negotiated prices) match the lines. Optional help:
+  // if it fails, the form simply shows no suggestions.
+  const checkCatalog = async (lines: OrderLine[]) => {
+    if (lines.length === 0) return;
+    setCheckingCatalog(true);
+    try {
+      setCatalogSuggestions(await api.articles.suggest(lines));
+    } catch {
+      setCatalogSuggestions([]);
+    } finally {
+      setCheckingCatalog(false);
+    }
+  };
+
+  // Open the catalog article as its own request in a new tab. A request has one vendor, and
+  // lines like delivery or levies belong to the quoted item, so this request stays as it is.
+  const orderFromCatalog = (index: number, suggestion: api.CatalogSuggestion) => {
+    const offer = suggestion.offers[0];
+    const amount = orderLines[index].amount;
+    const draft = {
+      title,
+      requestorName,
+      department,
+      commodityGroupId,
+      vendorName: offer.supplierName,
+      vatId: offer.supplierVatId ?? '',
+      line: {
+        positionDescription: `${suggestion.articleDescription} (${offer.articleNumber})`,
+        unitPrice: offer.unitPrice,
+        amount,
+        unit: offer.unit,
+        totalPrice: offer.unitPrice * amount,
+      },
+    };
+    window.open(`/dashboard/new-request?prefill=${encodeURIComponent(JSON.stringify(draft))}`, '_blank');
+  };
+
   // Remove order line
   const removeOrderLine = (index: number) => {
+    setCatalogSuggestions([]); // suggestions refer to line positions, which shift now
     const updated = orderLines.filter((_, i) => i !== index);
     setOrderLines(updated);
     const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
@@ -173,6 +230,7 @@ export default function NewRequestPage() {
   // Swap an alternative in for the line it replaces; that line becomes an alternative
   // itself, so the user can swap back. Other alternatives to the same line follow along.
   const swapInAlternative = (index: number) => {
+    setCatalogSuggestions([]); // they were for the line being replaced
     const chosen = alternatives[index];
     const replacedIndex = orderLines.findIndex((line) => line.position === chosen.alternativeTo);
     const updated = [...orderLines];
@@ -411,9 +469,20 @@ export default function NewRequestPage() {
         <div className="lio-card p-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-semibold tracking-tight text-ink">Order Lines *</h2>
-            <Button type="button" onClick={addOrderLine} variant="outline" size="sm">
-              + Add Line
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                onClick={() => checkCatalog(orderLines)}
+                variant="outline"
+                size="sm"
+                disabled={checkingCatalog || orderLines.length === 0}
+              >
+                {checkingCatalog ? 'Checking your catalog…' : 'Check catalog'}
+              </Button>
+              <Button type="button" onClick={addOrderLine} variant="outline" size="sm">
+                + Add Line
+              </Button>
+            </div>
           </div>
 
           {orderLines.length === 0 ? (
@@ -485,6 +554,39 @@ export default function NewRequestPage() {
                       €{line.totalPrice.toFixed(2)}
                     </span>
                   </div>
+
+                  {catalogSuggestions
+                    .filter((suggestion) => suggestion.lineIndex === index)
+                    .map((suggestion) => (
+                      <div
+                        key={suggestion.articleDescription}
+                        className="mt-3 flex items-start justify-between gap-4 rounded-lg border border-accent/40 bg-accent-soft/20 p-3 text-sm"
+                      >
+                        <div>
+                          <p className="font-medium text-ink">
+                            On your catalog ({suggestion.match}): {suggestion.articleDescription}
+                          </p>
+                          <p className="text-gray-600">
+                            {suggestion.offers[0].supplierName} · €{suggestion.offers[0].unitPrice.toFixed(2)} /{' '}
+                            {suggestion.offers[0].unit}
+                            {suggestion.saving !== null && ` · saves €${suggestion.saving.toFixed(2)}`}
+                          </p>
+                          <p className="text-gray-500">{suggestion.reason}</p>
+                          <p className="mt-1 text-xs text-gray-500">
+                            Opens a separate request. If you order from the catalog, remove this line here and
+                            anything that belongs to it (delivery, levies).
+                          </p>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => orderFromCatalog(index, suggestion)}
+                        >
+                          Order from catalog instead
+                        </Button>
+                      </div>
+                    ))}
                 </div>
               ))}
             </div>

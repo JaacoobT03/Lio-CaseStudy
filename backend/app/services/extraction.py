@@ -71,7 +71,7 @@ def _pdf_message(pdf_bytes: bytes, filename: str, commodity_groups_list: str) ->
     ]
 
 
-def _model_options() -> dict:
+def model_options() -> dict:
     """Reasoning models (e.g. Luna) take an effort level instead of a temperature;
     leave OPENAI_REASONING_EFFORT empty for older models such as gpt-4o-mini."""
     if settings.openai_reasoning_effort:
@@ -89,7 +89,7 @@ def _ask_model(client: OpenAI, user_content: str | list[dict], label: str) -> Ex
         max_output_tokens=8000,  # includes the model's reasoning, not just the answer
         store=False,  # don't keep customer quotes on OpenAI's side
         text_format=ExtractedVendorData,  # structured outputs: the reply must match this schema
-        **_model_options(),
+        **model_options(),
     )
     if response.usage:
         logger.info(
