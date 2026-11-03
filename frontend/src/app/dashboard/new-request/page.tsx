@@ -32,7 +32,7 @@ export default function NewRequestPage() {
   const [alternatives, setAlternatives] = useState<OrderLine[]>([]);
   const [catalogSuggestions, setCatalogSuggestions] = useState<api.CatalogSuggestion[]>([]);
   const [checkingCatalog, setCheckingCatalog] = useState(false);
-  const [totalCost, setTotalCost] = useState<number>(0);
+  const [extraCosts, setExtraCosts] = useState<api.ExtractedVendorData['extraCosts']>([]);
 
   // UI state
   const [file, setFile] = useState<File | null>(null);
@@ -41,6 +41,10 @@ export default function NewRequestPage() {
   const [warning, setWarning] = useState('');
   const [extracting, setExtracting] = useState(false);
   const [slowExtraction, setSlowExtraction] = useState(false);
+
+  // The net total, as on the quote: the lines plus extra costs (shipping, fees, levies)
+  const extraCostsTotal = extraCosts.reduce((sum, cost) => sum + cost.amount, 0);
+  const totalCost = orderLines.reduce((sum, line) => sum + line.totalPrice, 0) + extraCostsTotal;
 
   // The text pass alone took up to ~8 s in our evals. Past that, the backend may be
   // scanning the PDF pages, so the spinner says so (without claiming it for sure).
@@ -65,7 +69,6 @@ export default function NewRequestPage() {
     setVendorName(draft.vendorName);
     setVatId(draft.vatId);
     setOrderLines([draft.line]);
-    setTotalCost(draft.line.totalPrice);
     setSuccess('Prefilled from your catalog. Please check the quantity and submit.');
   }, []);
 
@@ -100,21 +103,12 @@ export default function NewRequestPage() {
       setVendorName(extracted.vendorName || '');
       setVatId(extracted.vatId || '');
       setDepartment(extracted.department || '');
-      // The lines being bought, plus extra costs (shipping, fees) as lines, so the total
-      // is the net total. Alternatives are listed separately; the user can swap one in.
-      const lines = [
-        ...extracted.orderLines.filter((line) => !line.isAlternative),
-        ...extracted.extraCosts.map((cost) => ({
-          positionDescription: `${cost.label} (extra cost)`,
-          unitPrice: cost.amount,
-          amount: 1,
-          unit: 'lump sum',
-          totalPrice: cost.amount,
-        })),
-      ];
+      // The lines being bought; extra costs (shipping, fees) get their own rows below them.
+      // Alternatives are listed separately; the user can swap one in.
+      const lines = extracted.orderLines.filter((line) => !line.isAlternative);
       setOrderLines(lines);
+      setExtraCosts(extracted.extraCosts);
       setAlternatives(extracted.orderLines.filter((line) => line.isAlternative));
-      setTotalCost(lines.reduce((sum, line) => sum + line.totalPrice, 0));
       
       // Set commodity group (now included in extraction)
       if (extracted.commodityGroupId) {
@@ -175,10 +169,6 @@ export default function NewRequestPage() {
     }
     
     setOrderLines(updated);
-    
-    // Update total cost
-    const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
-    setTotalCost(newTotal);
   };
 
   // Ask which catalog articles (negotiated prices) match the lines. Optional help:
@@ -223,8 +213,6 @@ export default function NewRequestPage() {
     setCatalogSuggestions([]); // suggestions refer to line positions, which shift now
     const updated = orderLines.filter((_, i) => i !== index);
     setOrderLines(updated);
-    const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
-    setTotalCost(newTotal);
   };
 
   // Swap an alternative in for the line it replaces; that line becomes an alternative
@@ -247,7 +235,6 @@ export default function NewRequestPage() {
     }
     setOrderLines(updated);
     setAlternatives(remaining);
-    setTotalCost(updated.reduce((sum, line) => sum + line.totalPrice, 0));
   };
 
   // Submit form
@@ -279,7 +266,17 @@ export default function NewRequestPage() {
         commodityGroupId: commodityGroupId,
         totalCost,
         department,
-        orderLines,
+        // The database has only lines and one total, so extra costs are saved as labelled lines
+        orderLines: [
+          ...orderLines,
+          ...extraCosts.map((cost) => ({
+            positionDescription: `${cost.label} (extra cost)`,
+            unitPrice: cost.amount,
+            amount: 1,
+            unit: 'lump sum',
+            totalPrice: cost.amount,
+          })),
+        ],
       });
 
       // Attach the original PDF (if one was uploaded) so it shows on the detail page.
@@ -591,6 +588,48 @@ export default function NewRequestPage() {
               ))}
             </div>
           )}
+
+          {/* Extra costs from the quote: not items, but part of the total */}
+          {extraCosts.length > 0 && (
+            <div className="mt-6">
+              <h3 className="text-sm font-medium text-gray-700 mb-2">Extra costs</h3>
+              <div className="space-y-2">
+                {extraCosts.map((cost, index) => (
+                  <div key={index} className="flex items-end gap-3">
+                    <div className="flex-1">
+                      <Input
+                        value={cost.label}
+                        onChange={(e) =>
+                          setExtraCosts(extraCosts.map((c, i) => (i === index ? { ...c, label: e.target.value } : c)))
+                        }
+                        required
+                      />
+                    </div>
+                    <div className="w-36 shrink-0">
+                      <Input
+                        type="number"
+                        step="0.01"
+                        value={cost.amount}
+                        onChange={(e) =>
+                          setExtraCosts(
+                            extraCosts.map((c, i) => (i === index ? { ...c, amount: parseFloat(e.target.value) || 0 } : c))
+                          )
+                        }
+                        required
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setExtraCosts(extraCosts.filter((_, i) => i !== index))}
+                      className="text-red-600 hover:text-red-700 text-sm h-11"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Alternatives offered by the vendor: not in the total until swapped in */}
@@ -631,6 +670,9 @@ export default function NewRequestPage() {
               €{totalCost.toFixed(2)}
             </span>
           </div>
+          {extraCostsTotal > 0 && (
+            <p className="text-sm text-gray-600 text-right mt-1">incl. €{extraCostsTotal.toFixed(2)} extra costs</p>
+          )}
         </div>
 
         {/* Submit */}
