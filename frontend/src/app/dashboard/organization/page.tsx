@@ -27,6 +27,7 @@ export default function OrganizationPage() {
   const [role, setRole] = useState<api.MemberRole | null>(null);
   const [requiredFields, setRequiredFields] = useState<api.ConfigurableRequiredField[]>([]);
   const [savingSettings, setSavingSettings] = useState(false);
+  const [approvalLimit, setApprovalLimit] = useState(''); // empty = every request needs approval
 
   useEffect(() => {
     loadOrganization();
@@ -48,6 +49,7 @@ export default function OrganizationPage() {
       setMembers(result.members);
       setInvites(result.invites);
       setRequiredFields(settings.required_fields);
+      setApprovalLimit(settings.auto_approve_below?.toString() ?? '');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load organization');
     }
@@ -109,6 +111,23 @@ export default function OrganizationPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update settings');
       await loadOrganization(); // revert to server state
+    }
+    setSavingSettings(false);
+  };
+
+  const saveApprovalLimit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingSettings(true);
+    setError('');
+    setSuccess('');
+    try {
+      const saved = await api.organizations.updateSettings({
+        auto_approve_below: approvalLimit === '' ? null : Number(approvalLimit),
+      });
+      setApprovalLimit(saved.auto_approve_below?.toString() ?? '');
+      setSuccess('Settings updated');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to update settings');
     }
     setSavingSettings(false);
   };
@@ -292,6 +311,26 @@ export default function OrganizationPage() {
               );
             })}
           </div>
+
+          <h2 className="text-xl font-semibold tracking-tight text-ink mt-8">Approvals</h2>
+          <p className="text-sm text-ink/55 mt-1 mb-4">
+            Requests with a net total below this amount are approved automatically. Leave it empty to
+            require approval for every request.
+          </p>
+          <form onSubmit={saveApprovalLimit} className="flex items-end gap-2 max-w-sm">
+            <Input
+              label="Approve automatically below (€, net)"
+              type="number"
+              min="0"
+              step="0.01"
+              value={approvalLimit}
+              onChange={(e) => setApprovalLimit(e.target.value)}
+              disabled={savingSettings}
+            />
+            <Button type="submit" disabled={savingSettings}>
+              Save
+            </Button>
+          </form>
         </div>
       )}
     </div>

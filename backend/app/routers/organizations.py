@@ -95,9 +95,12 @@ def update_settings(
     db: Session = Depends(get_db),
 ) -> OrganizationSettings:
     org = db.get(Organization, membership.organization_id)
-    org.settings = payload.model_dump()
+    # Merge: only the settings sent are changed. (Replacing the whole object meant
+    # that saving "required fields" wiped every other setting.)
+    merged = OrganizationSettings(**{**(org.settings or {}), **payload.model_dump(exclude_unset=True)})
+    org.settings = merged.model_dump()
     db.commit()
-    return payload
+    return merged
 
 
 @router.get("/me/members", response_model=MembersResponse)

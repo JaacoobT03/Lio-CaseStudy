@@ -136,6 +136,38 @@ def seed_articles(db: Session, organization_id: uuid.UUID) -> int:
     return len(new)
 
 
+# Acme's accounting quirks (from the customer): cable ties, printer toner and small
+# software subscriptions are booked in fixed groups. "Office Supplies" doesn't exist
+# in the shared taxonomy, so Acme gets it as its own group.
+ACME_OFFICE_SUPPLIES = (100001, "Office & Administration", "Office Supplies")
+ACME_BOOKING_RULES = [
+    {"name": "Cable ties", "keywords": ["cable tie", "kabelbinder", "zip tie"],
+     "commodity_group_id": 11},  # Facility Management > Electrical Engineering
+    {"name": "Printer toner", "keywords": ["toner"],
+     "commodity_group_id": 29},  # Information Technology > Hardware
+    {"name": "Small software subscriptions",
+     "keywords": ["software subscription", "saas", "software-abonnement", "software abo"],
+     "commodity_group_id": ACME_OFFICE_SUPPLIES[0],
+     "max_net_total": 2000},  # "small": placeholder limit, to confirm with Acme
+]
+
+
+def seed_acme_customizations(db: Session, acme: Organization) -> int:
+    """Acme's own commodity group and booking rules, unless already present."""
+    created = 0
+    group_id, category, name = ACME_OFFICE_SUPPLIES
+    if db.get(CommodityGroup, group_id) is None:
+        db.add(CommodityGroup(id=group_id, category=category, name=name, organization_id=acme.id))
+        created += 1
+    if "classification_rules" not in (acme.settings or {}):
+        acme.settings = {**(acme.settings or {}), "classification_rules": ACME_BOOKING_RULES}
+        created += 1
+    if "auto_approve_below" not in (acme.settings or {}):
+        acme.settings = {**(acme.settings or {}), "auto_approve_below": 2000}  # no approval below €2,000 net
+        created += 1
+    return created
+
+
 def seed_organizations_and_accounts(db: Session) -> tuple[int, int]:
     """Create the tenants and their accounts (keyed by slug / email)."""
     orgs_created = 0
@@ -179,6 +211,8 @@ def seed(db: Session) -> dict[str, int]:
         "suppliers": seed_suppliers(db, dev_org_id) if dev_org_id else 0,
         # Articles reference suppliers by name, so this must run after suppliers.
         "articles": seed_articles(db, dev_org_id) if dev_org_id else 0,
+        # Runs after the shared groups, so the rules' target groups exist.
+        "acme_customizations": seed_acme_customizations(db, dev_org) if dev_org else 0,
         "organizations": orgs_created,
         "users": users_created,
     }

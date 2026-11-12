@@ -11,6 +11,20 @@ MemberRole = Literal["admin", "buyer", "requester"]
 ConfigurableRequiredField = Literal["vat_id", "department"]
 
 
+class ClassificationRule(BaseModel):
+    """A company's booking rule, e.g. "cable ties are always Electrical Engineering"."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    # Matched (case-insensitive) in the order line descriptions; list every
+    # language the quotes come in, e.g. "cable tie" and "kabelbinder".
+    keywords: list[str] = Field(min_length=1)
+    commodity_group_id: int
+    # Only applies while the lines' net total stays below this amount.
+    max_net_total: float | None = None
+
+
 class OrganizationSettings(BaseModel):
     """Per-organization configuration. Stored as JSONB, validated here.
 
@@ -21,6 +35,9 @@ class OrganizationSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     required_fields: list[ConfigurableRequiredField] = Field(default_factory=list)
+    classification_rules: list[ClassificationRule] = Field(default_factory=list)
+    # Requests with a net amount below this are approved automatically; None = all need approval.
+    auto_approve_below: float | None = Field(default=None, ge=0)
 
 
 class OrganizationCreate(BaseModel):

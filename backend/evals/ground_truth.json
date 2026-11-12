@@ -1,0 +1,126 @@
+{
+  "_about": [
+    "Answer key for the five sample quotes: what a perfect extraction returns.",
+    "The quote PDFs are NOT in the repo (they contain real names and bank details); the scorer reads them from a folder you pass in.",
+    "Money is NET (excl. VAT). 'lines' = the numbered positions actually being bought. 'alternatives' = positions offered instead of another one.",
+    "'extra_costs' = costs that appear only in the summary block (shipping, fees), not as a position.",
+    "net_total = sum(lines) + sum(extra_costs). gross_total = net_total + vat_amount.",
+    "unit_price is the effective net price after any discount. A null in 'department' means the field should stay empty."
+  ],
+  "quotes": [
+    {
+      "file": "AN-4120-Kdnr-14918.pdf",
+      "vendor": ["Dream in Green"],
+      "vat_id": "DE325240530",
+      "department": [null],
+      "lines": [
+        {"pos": "2", "description": "Moosbild Mix-Moos 160x80 cm", "quantity": 1, "unit": "piece", "unit_price": 715.26, "total": 715.26},
+        {"pos": "3", "description": "Logointegration \"asklio\" horizontal", "quantity": 1, "unit": "piece", "unit_price": 622.00, "total": 622.00}
+      ],
+      "alternatives": [
+        {"pos": "5", "alternative_to": "3", "description": "Logointegration \"asklio\" vertikal", "quantity": 1, "unit": "piece", "unit_price": 430.00, "total": 430.00}
+      ],
+      "extra_costs": [{"label": "Versandkosten (shipping)", "amount": 215.00}],
+      "net_total": 1552.26,
+      "vat_amount": 294.93,
+      "gross_total": 1847.19,
+      "category_ids": [15],
+      "notes": [
+        "Pos. 1 and 4 are headings without prices, not lines.",
+        "Pos. 2: list price 894.08 minus 20% discount = 715.26.",
+        "Pos. 5 is marked '(Alt.)' under the heading 'Alternativ: Logo vertikal'; the page subtotal 1,337.26 excludes it.",
+        "Summary block: Positionen netto 1,337.26 + Versandkosten netto 215.00; VAT 254.08 + 40.85 = 294.93; Endsumme 1,847.19."
+      ]
+    },
+    {
+      "file": "AN-OF2312380-Kdnr-57692.pdf",
+      "vendor": ["FlowerArt", "styleGREEN"],
+      "vat_id": "DE271073640",
+      "department": [null],
+      "lines": [
+        {"pos": "1", "description": "styleGREEN INDIVIDUAL - m2 Modul, Wald- und Kugelmoos 160 x 80 cm", "quantity": 1.28, "unit": "m²", "unit_price": 559.00, "total": 715.52},
+        {"pos": "2", "description": "styleGREEN INDIVIDUAL - Kantenbegrünung Waldmoos pro Lfm 160 x 80 cm", "quantity": 4.80, "unit": "running metre", "unit_price": 25.13, "total": 120.62},
+        {"pos": "3", "description": "Logo Acrylglas weiß 5mm \"ask Lio\", Länge 80 cm, mit Abstandshalter", "quantity": 1, "unit": "piece", "unit_price": 350.00, "total": 350.00}
+      ],
+      "alternatives": [],
+      "extra_costs": [{"label": "Versandkosten (shipping)", "amount": 113.85}],
+      "net_total": 1299.99,
+      "vat_amount": 247.00,
+      "gross_total": 1546.99,
+      "category_ids": [15],
+      "notes": [
+        "Legal vendor name (FlowerArt GmbH) and VAT ID appear only in the letterhead/footer, which is a background IMAGE: not in the text layer.",
+        "'Moospärchen ... UVP 79 €' is an advert, not a line. The diesel surcharge is announced without an amount: not a cost.",
+        "Summary block: Positionen netto 1,186.14 + Versandkosten netto 113.85; VAT 225.37 + 21.63 = 247.00; Endsumme 1,546.99."
+      ]
+    },
+    {
+      "file": "AngebotA0492_23.Pdf",
+      "vendor": ["Gregg"],
+      "vat_id": "DE198570491",
+      "department": [null],
+      "lines": [
+        {"pos": "1.1", "description": "Moosbild \"70:30\" mit Schriftzug \"askLio\"", "quantity": 1, "unit": "piece", "unit_price": 1438.00, "total": 1438.00},
+        {"pos": "1.2", "description": "Transport, Verpackung und Versand", "quantity": 1, "unit": "piece", "unit_price": 320.00, "total": 320.00}
+      ],
+      "alternatives": [
+        {"pos": "1.1a", "alternative_to": "1.1", "description": "Wie Pos. zuvor, jedoch nur Ballenmoos", "quantity": 1, "unit": "piece", "unit_price": 1926.00, "total": 1926.00},
+        {"pos": "1.1b", "alternative_to": "1.1", "description": "Wie Pos. 1.1, jedoch flächig mit Waldmoos, Logo-Element in Ballenmoos", "quantity": 1, "unit": "piece", "unit_price": 1685.00, "total": 1685.00}
+      ],
+      "extra_costs": [],
+      "net_total": 1758.00,
+      "vat_amount": 334.02,
+      "gross_total": 2092.02,
+      "category_ids": [15],
+      "notes": [
+        "'1. Moosbild' is a heading, not a line. 'Übertrag' (1,438.00) is a page carry-over, not a line.",
+        "1.1a and 1.1b are labelled 'Alternativ zu vorstehender Position' and show only a unit price ('E.P.'), no line total.",
+        "Transport is a real position (1.2, with article number), so it is a line, not an extra cost.",
+        "Summary block: Nettosumme 1,758.00; Umsatzsteuer 19% 334.02; Gesamtsumme 2,092.02."
+      ]
+    },
+    {
+      "file": "Angebot_Hoffmann_Nuernberg_ACME_Schleifmaschine.pdf",
+      "vendor": ["Hoffmann"],
+      "vat_id": null,
+      "department": [null, "Einkauf / Technik"],
+      "lines": [
+        {"pos": "1", "description": "Schleifmaschine HN-GS 450", "quantity": 1, "unit": "piece", "unit_price": 15000.00, "total": 15000.00},
+        {"pos": "2", "description": "Lieferung und Montage", "quantity": 1, "unit": "lump sum", "unit_price": 2000.00, "total": 2000.00}
+      ],
+      "alternatives": [],
+      "extra_costs": [],
+      "net_total": 17000.00,
+      "vat_amount": 3230.00,
+      "gross_total": 20230.00,
+      "category_ids": [45],
+      "notes": [
+        "No VAT ID anywhere in the document.",
+        "Addressed to 'ACME Corp, z. Hd. Einkauf / Technik': a department named explicitly.",
+        "The document itself is printed without umlauts ('Nurnberg'); this is not a parsing error.",
+        "Summary block: Zwischensumme netto 17,000.00; MwSt. 19% 3,230.00; Gesamtbetrag brutto 20,230.00."
+      ]
+    },
+    {
+      "file": "Quote_1__Lio_Technologies_GmbH__1x_MBA___2212618452.pdf",
+      "vendor": ["Apple"],
+      "vat_id": "DE258811348",
+      "department": [null],
+      "lines": [
+        {"pos": "1", "description": "13\" MacBook Air: Apple M2 Chip - Space Grau (16 GB, 512 GB SSD)", "quantity": 1, "unit": "piece", "unit_price": 1467.61, "total": 1467.61}
+      ],
+      "alternatives": [],
+      "extra_costs": [{"label": "Urheberrechtsabgabe (copyright levy)", "amount": 10.55}],
+      "net_total": 1478.16,
+      "vat_amount": 280.85,
+      "gross_total": 1759.01,
+      "category_ids": [29, 96],
+      "notes": [
+        "Category: 29 'Information Technology > Hardware' or 96 'Information Technology > Business Laptop' (more specific, added after the gpt-6-luna run chose it). Variants such as 'Business Laptop - Mid-range' don't count: the quote doesn't say which tier.",
+        "The quote has no position numbers; the single product row is treated as position 1.",
+        "The levy is listed after VAT, but VAT 280.85 = 19% of (1,467.61 + 10.55), so the levy is part of the net.",
+        "Vendor appears as 'Apple Business Team' with UID DE258811348; no legal entity name on the quote."
+      ]
+    }
+  ]
+}

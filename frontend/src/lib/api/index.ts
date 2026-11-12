@@ -47,6 +47,7 @@ export type ConfigurableRequiredField = 'vat_id' | 'department';
 
 export interface OrganizationSettings {
   required_fields: ConfigurableRequiredField[];
+  auto_approve_below?: number | null; // requests below this net amount need no approval
 }
 
 export interface MembersResponse {
@@ -84,13 +85,22 @@ export interface UpdateRequestInput {
   orderLines: OrderLineInput[];
 }
 
+export interface ExtractedOrderLine extends OrderLineInput {
+  position: string | null;
+  isAlternative: boolean;
+  alternativeTo: string | null;
+}
+
 export interface ExtractedVendorData {
-  title: string;
-  vendorName: string;
-  vatId: string;
-  department: string;
-  orderLines: OrderLineInput[];
-  totalCost: number;
+  title: string | null;
+  vendorName: string | null;
+  vatId: string | null;
+  department: string | null;
+  orderLines: ExtractedOrderLine[];
+  extraCosts: { label: string; amount: number }[];
+  netTotal: number | null;
+  vatAmount: number | null;
+  grossTotal: number | null;
   commodityGroupId: number | null;
   commodityGroupName: string | null;
 }
@@ -100,6 +110,9 @@ export interface ExtractionResponse {
   data?: ExtractedVendorData;
   error?: string;
   missingFields?: string[];
+  warnings?: string[];
+  scannedBecause?: string | null;
+  classificationNote?: string | null;
 }
 
 export interface Supplier {
@@ -125,6 +138,24 @@ export interface Article {
   unit: string;
   quantity: string;
   created_at: string;
+}
+
+export interface CatalogOffer {
+  articleNumber: string;
+  supplierName: string;
+  supplierVatId: string | null;
+  unitPrice: number;
+  unit: string;
+}
+
+/** A catalog article matching one request line; offers sorted cheapest first. */
+export interface CatalogSuggestion {
+  lineIndex: number;
+  articleDescription: string;
+  match: 'same' | 'comparable';
+  reason: string;
+  offers: CatalogOffer[];
+  saving: number | null;
 }
 
 export interface ArticlePage {
@@ -260,7 +291,7 @@ export const organizations = {
     return apiFetch('/organizations/me/settings');
   },
 
-  updateSettings(settings: OrganizationSettings): Promise<OrganizationSettings> {
+  updateSettings(settings: Partial<OrganizationSettings>): Promise<OrganizationSettings> {
     return apiFetch('/organizations/me/settings', { method: 'PATCH', body: settings });
   },
 };
@@ -298,6 +329,13 @@ export const suppliers = {
 // ============================================================================
 
 export const articles = {
+  /** Catalog articles (negotiated prices) matching the given request lines. */
+  suggest(
+    lines: { positionDescription: string; unitPrice: number; amount: number; unit: string }[]
+  ): Promise<CatalogSuggestion[]> {
+    return apiFetch('/articles/suggest', { body: { lines } });
+  },
+
   list(params?: {
     search?: string;
     supplierId?: string;
@@ -330,7 +368,10 @@ export const pdf = {
 };
 
 export const extraction = {
-  extract(text: string): Promise<ExtractionResponse> {
-    return apiFetch('/extraction', { body: { text } });
+  /** Send the quote PDF itself; the backend reads it (text first, the PDF if needed). */
+  extract(file: File): Promise<ExtractionResponse> {
+    const formData = new FormData();
+    formData.append('file', file);
+    return apiFetch('/extraction', { formData });
   },
 };

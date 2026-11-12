@@ -4,6 +4,7 @@ Run with: python -m pytest tests/ -q   (or plainly: python tests/test_smoke.py)
 """
 import io
 import uuid
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
@@ -419,9 +420,9 @@ def test_activity_log_and_document():
     payload = {
         "requestorName": "Alex Admin", "titleShortDescription": "Chairs",
         "vendorName": "FurnitureCo", "vatId": "DE1", "commodityGroupId": 15,
-        "totalCost": 500.0, "department": "Ops",
+        "totalCost": 5000.0, "department": "Ops",  # above Acme's auto-approval limit
         "orderLines": [
-            {"positionDescription": "Chair", "unitPrice": 250, "amount": 2, "unit": "pc", "totalPrice": 500}
+            {"positionDescription": "Chair", "unitPrice": 2500, "amount": 2, "unit": "pc", "totalPrice": 5000}
         ],
     }
     rid = client.post("/requests", json=payload, headers=_auth(admin)).json()["id"]
@@ -429,14 +430,14 @@ def test_activity_log_and_document():
     # edit two fields -> one 'updated' activity naming those fields
     updated = dict(payload)
     updated["title"] = "Office Chairs"
-    updated["totalCost"] = 600.0
+    updated["totalCost"] = 6000.0
     updated["orderLines"] = [
-        {"positionDescription": "Chair", "unitPrice": 300, "amount": 2, "unit": "pc", "totalPrice": 600}
+        {"positionDescription": "Chair", "unitPrice": 3000, "amount": 2, "unit": "pc", "totalPrice": 6000}
     ]
     # RequestUpdate uses "title" (not titleShortDescription)
     updated = {
         "requestorName": "Alex Admin", "title": "Office Chairs", "vendorName": "FurnitureCo",
-        "vatId": "DE1", "commodityGroupId": 15, "totalCost": 600.0, "department": "Ops",
+        "vatId": "DE1", "commodityGroupId": 15, "totalCost": 6000.0, "department": "Ops",
         "orderLines": updated["orderLines"],
     }
     r = client.put(f"/requests/{rid}", json=updated, headers=_auth(admin))
@@ -479,21 +480,372 @@ def test_activity_log_and_document():
     client.delete(f"/requests/{rid}", headers=_auth(admin))
 
 
+def _tiny_pdf() -> bytes:
+    """A blank one-page PDF, enough to pass the upload checks."""
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=200, height=200)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
+def _upload_for_extraction(token: str) -> dict:
+    r = client.post(
+        "/extraction",
+        files={"file": ("quote.pdf", _tiny_pdf(), "application/pdf")},
+        headers=_auth(token),
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
 def test_extraction_without_api_key():
     r = client.post("/auth/signup", json={"email": "ex@example.com", "password": "secret123"})
     token = r.json()["access_token"]
 
-    r = client.post("/extraction", json={"text": "Angebot Nr. 123"}, headers=_auth(token))
-    assert r.status_code == 200
-    body = r.json()
+    body = _upload_for_extraction(token)
     # Without OPENAI_API_KEY configured the endpoint reports a clean failure
     # envelope rather than an HTTP error.
     assert body["success"] is False
     assert "OPENAI_API_KEY" in body["error"]
 
-    # empty text
-    r = client.post("/extraction", json={"text": "  "}, headers=_auth(token))
-    assert r.json()["success"] is False
+    # non-PDF rejected
+    r = client.post(
+        "/extraction",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+        headers=_auth(token),
+    )
+    assert r.status_code == 400
+
+
+class FakeOpenAI:
+    """Stands in for openai.OpenAI in tests: answers each call with the next
+    reply from `replies` and remembers every request, so no real API call is made."""
+
+    replies: list[dict] = []
+    requests: list[dict] = []
+
+    def __init__(self, api_key=None, **options):
+        self.responses = SimpleNamespace(parse=self._parse)
+
+    def _parse(self, **request):
+        FakeOpenAI.requests.append(request)
+        # Like the real structured-outputs call: the reply is checked against the schema.
+        parsed = request["text_format"].model_validate(FakeOpenAI.replies.pop(0))
+        return SimpleNamespace(
+            output_parsed=parsed, status="completed", incomplete_details=None, usage=None
+        )
+
+
+def _use_fake_openai(monkeypatch, *replies: dict, pdf_text: str):
+    """Route extraction through FakeOpenAI, one reply per model call.
+    `pdf_text` is what pypdf "finds" in the uploaded PDF ("" = no text layer)."""
+    from app.core.config import settings
+    from app.services import extraction
+
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(extraction, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(extraction, "extract_text", lambda pdf_bytes: pdf_text)
+    FakeOpenAI.replies = list(replies)
+    FakeOpenAI.requests = []
+    r = client.post("/auth/signup", json={"email": f"{uuid.uuid4().hex}@example.com", "password": "secret123"})
+    return r.json()["access_token"]
+
+
+def _sent_pdf(request: dict) -> bool:
+    """Did this model call carry the PDF file itself?"""
+    content = request["input"][0]["content"]
+    return isinstance(content, list) and content[0]["type"] == "input_file"
+
+
+# A complete answer, as the model gives it for a quote it can read fully.
+COMPLETE_REPLY = {
+    "title": "Moss wall",
+    "vendorName": "FlowerArt GmbH",
+    "vatId": "DE271073640",
+    "department": None,
+    "orderLines": [{"position": "1", "positionDescription": "Moss module", "amount": 1.28, "unit": "m²",
+                    "unitPrice": 559, "totalPrice": 715.52, "isAlternative": False, "alternativeTo": None}],
+    "extraCosts": [{"label": "Versandkosten", "amount": 113.85}],
+    "netTotal": 829.37,
+    "vatAmount": 157.58,
+    "grossTotal": 986.95,
+    "commodityGroupId": 15,
+    "commodityGroupName": "Office Equipment",
+}
+
+
+def test_extraction_reads_text_first(monkeypatch):
+    """If the text gives us every key field, the PDF is never sent: one cheap call."""
+    token = _use_fake_openai(monkeypatch, COMPLETE_REPLY, pdf_text="Angebot OF2312380 ...")
+
+    body = _upload_for_extraction(token)
+
+    assert body["success"] is True, body
+    assert len(FakeOpenAI.requests) == 1
+    assert not _sent_pdf(FakeOpenAI.requests[0])
+    assert FakeOpenAI.requests[0]["store"] is False  # customer quotes aren't kept at OpenAI
+    assert FakeOpenAI.requests[0]["text_format"].__name__ == "ExtractedVendorData"  # structured outputs
+    assert body["scannedBecause"] is None
+
+
+def test_extraction_falls_back_to_pdf(monkeypatch):
+    """styleGREEN: the text lacks the VAT ID (it's in an image) and names the customer
+    as vendor. The PDF pass is used, and the vendor disagreement is flagged."""
+    from_text = {**COMPLETE_REPLY, "vendorName": "Lio Technologies GmbH", "vatId": None}
+    token = _use_fake_openai(monkeypatch, from_text, COMPLETE_REPLY, pdf_text="Angebot OF2312380 ...")
+
+    body = _upload_for_extraction(token)
+
+    assert body["success"] is True, body
+    assert len(FakeOpenAI.requests) == 2
+    assert not _sent_pdf(FakeOpenAI.requests[0]) and _sent_pdf(FakeOpenAI.requests[1])
+    assert body["data"]["vendorName"] == "FlowerArt GmbH"
+    assert body["data"]["vatId"] == "DE271073640"
+    assert any("Vendor" in warning for warning in body["warnings"])
+    assert body["scannedBecause"] == "VAT ID not found in the text"
+
+
+def test_same_vendor_spelled_differently_is_not_flagged():
+    """Real cases from the eval: the same company written two ways is not a
+    disagreement; two unrelated names are."""
+    from app.schemas.extraction import ExtractedVendorData as Data
+    from app.services.extraction import _disagreements
+
+    assert _disagreements(Data(vendorName="styleGREEN / FlowerArt GmbH"),
+                          Data(vendorName="FlowerArt GmbH (styleGREEN)")) == []
+    assert _disagreements(Data(vendorName="Hoffmann Nurnberg GmbH"),
+                          Data(vendorName="Hoffmann Nürnberg GmbH")) == []
+    assert len(_disagreements(Data(vendorName="Lio Technologies GmbH"),
+                              Data(vendorName="FlowerArt GmbH"))) == 1
+
+
+def test_number_checks_flag_what_does_not_add_up():
+    """A quote states its numbers more than once, so code can check the model's reading.
+    The numbers are from real eval runs."""
+    from app.schemas.extraction import ExtractedVendorData as Data
+    from app.services.extraction import _check_numbers
+
+    def line(amount, unit_price, total):
+        return {"positionDescription": "x", "amount": amount, "unit": "piece",
+                "unitPrice": unit_price, "totalPrice": total, "isAlternative": False}
+
+    # styleGREEN read correctly: lines + shipping = net, net + VAT = gross.
+    # (4.8 x 25.13 = 120.624 is printed as 120.62: rounding is fine.)
+    style_green = Data(orderLines=[line(1.28, 559, 715.52), line(4.8, 25.13, 120.62), line(1, 350, 350)],
+                       extraCosts=[{"label": "Versandkosten", "amount": 113.85}],
+                       netTotal=1299.99, vatAmount=247.00, grossTotal=1546.99)
+    assert _check_numbers(style_green) == []
+    # Misread net totals, while lines + extra costs + VAT still give the printed gross: the
+    # quote confirms what we save, so no warning. styleGREEN read as 1,300.00; Apple without
+    # the levy; Dream in Green's "Positionen netto" (before shipping).
+    assert _check_numbers(style_green.model_copy(update={"net_total": 1300.00})) == []
+    apple = Data(orderLines=[line(1, 1467.61, 1467.61)],
+                 extraCosts=[{"label": "Urheberrechtsabgabe", "amount": 10.55}],
+                 netTotal=1467.61, vatAmount=280.85, grossTotal=1759.01)
+    assert _check_numbers(apple) == []
+    dream_in_green = Data(orderLines=[line(1, 715.26, 715.26), line(1, 622, 622)],
+                          extraCosts=[{"label": "Versandkosten", "amount": 215}],
+                          netTotal=1337.26, vatAmount=294.93, grossTotal=1847.19)
+    assert _check_numbers(dream_in_green) == []
+    # A misread line (350 read as 530) is still caught: net and gross agree, the lines don't.
+    misread_line = Data(orderLines=[line(1.28, 559, 715.52), line(4.8, 25.13, 120.62), line(1, 530, 530)],
+                        extraCosts=[{"label": "Versandkosten", "amount": 113.85}],
+                        netTotal=1299.99, vatAmount=247.00, grossTotal=1546.99)
+    warnings = _check_numbers(misread_line)
+    assert len(warnings) == 1 and warnings[0].startswith("The lines and extra costs add up to €1,479.99")
+    # A line that doesn't multiply out (list price instead of the discounted one).
+    assert _check_numbers(Data(orderLines=[line(1, 894.08, 715.26)]))[0].startswith("Pos. 1:")
+
+
+def test_booking_rules_match_lines_by_value():
+    """Acme's booking rules (as seeded): keywords in either language, judged by the
+    lines that make up most of the net value, and the "small" limit."""
+    from app.schemas.organizations import ClassificationRule
+    from app.seed import ACME_BOOKING_RULES
+    from app.services.classification import match_rule
+
+    rules = [ClassificationRule(**rule) for rule in ACME_BOOKING_RULES]
+    name = lambda lines: (match_rule(rules, lines) or SimpleNamespace(name=None)).name  # noqa: E731
+
+    assert name([("Kabelbinder 200 mm schwarz, 1000 Stk.", 49.0)]) == "Cable ties"
+    assert name([("Cable ties UV-resistant, pack of 100", 12.5)]) == "Cable ties"
+    assert name([("Toner cartridge black HP 305A", 89.0)]) == "Printer toner"
+    assert name([("Figma software subscription, 12 months", 540.0)]) == "Small software subscriptions"
+    assert name([("Enterprise software subscription", 5000.0)]) is None  # not "small"
+    # €20 of cable ties inside a €10,000 machine order don't make it a cable-tie order.
+    assert name([("Kabelbinder", 20.0), ("CNC machine", 10000.0)]) is None
+    assert name([("Moosbild mit Logo", 1438.0)]) is None
+
+
+def test_acme_office_supplies_group_is_acme_only():
+    """Acme's own "Office Supplies" group: Acme sees it and can use it; BMW can do neither."""
+    acme, bmw = _signin("requester@acme.com"), _signin("admin@bmw.com")
+
+    def group_ids(token):
+        return {g["id"] for g in client.get("/commodity-groups", headers=_auth(token)).json()}
+
+    assert 100001 in group_ids(acme)
+    assert 100001 not in group_ids(bmw)
+
+    request = {"requestorName": "R", "titleShortDescription": "Figma", "vendorName": "Figma Inc.",
+               "commodityGroupId": 100001, "totalCost": 540.0,
+               "orderLines": [{"positionDescription": "Figma subscription", "unitPrice": 540.0,
+                               "amount": 1, "unit": "year", "totalPrice": 540.0}]}
+    assert client.post("/requests", json=request, headers=_auth(acme)).status_code == 201
+    assert client.post("/requests", json=request, headers=_auth(bmw)).status_code == 422
+
+
+def test_saving_one_setting_keeps_the_others():
+    """Saving "required fields" used to replace the whole settings object, which
+    would have wiped Acme's booking rules."""
+    admin = _signin("admin@acme.com")
+    r = client.patch("/organizations/me/settings", json={"required_fields": ["vat_id"]}, headers=_auth(admin))
+    assert r.status_code == 200, r.text
+    settings = client.get("/organizations/me/settings", headers=_auth(admin)).json()
+    assert settings["required_fields"] == ["vat_id"]
+    assert len(settings["classification_rules"]) == 3
+    # restore
+    client.patch("/organizations/me/settings", json={"required_fields": []}, headers=_auth(admin))
+
+
+def test_extraction_applies_the_booking_rule(monkeypatch):
+    """The AI files cable ties under Consumables; Acme's rule pre-selects Electrical
+    Engineering and says so."""
+    cable_ties = {**COMPLETE_REPLY, "commodityGroupId": 49, "commodityGroupName": "Consumables",
+                  "orderLines": [{**COMPLETE_REPLY["orderLines"][0],
+                                  "positionDescription": "Kabelbinder 200 mm, 1000 Stk."}]}
+    _use_fake_openai(monkeypatch, cable_ties, pdf_text="Angebot Kabelbinder ...")
+
+    body = _upload_for_extraction(_signin("requester@acme.com"))
+
+    assert body["data"]["commodityGroupId"] == 11
+    assert body["classificationNote"] == "booking rule 'Cable ties' (Facility Management › Electrical Engineering)"
+
+
+def test_auto_approval_below_limit():
+    """Acme approves requests below €2,000 net automatically. More money after an approval
+    (automatic or by a person) needs a new decision; BMW has no limit."""
+    requester, buyer = _signin("requester@acme.com"), _signin("buyer@acme.com")
+
+    def payload(unit_price, amount=1, total=None):
+        line_total = unit_price * amount
+        return {
+            "requestorName": "Rene Requester", "vendorName": "V",
+            "titleShortDescription": "Test", "title": "Test",  # create and edit name it differently
+            "vatId": "DE1", "commodityGroupId": 31, "department": "IT",
+            "totalCost": line_total if total is None else total,
+            "orderLines": [{"positionDescription": "Item", "unitPrice": unit_price, "amount": amount,
+                            "unit": "piece", "totalPrice": line_total if total is None else total}],
+        }
+
+    def create(body, token=requester):
+        r = client.post("/requests", json=body, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    def edit(request_id, body):
+        r = client.put(f"/requests/{request_id}", json=body, headers=_auth(requester))
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    small = create(payload(1500))
+    assert small["approval_status"] == "approved" and small["approved_by"] is None
+    activity = client.get(f"/requests/{small['id']}/activity", headers=_auth(requester)).json()
+    assert "approved automatically" in activity[0]["summary"]
+
+    assert create(payload(2000))["approval_status"] == "pending"  # "below" means below
+    # A client claiming €100 for 3 x €1,000 doesn't get past the limit.
+    assert create(payload(1000, amount=3, total=100))["approval_status"] == "pending"
+
+    # Edited above the limit: back to pending. Edited below again: approved automatically.
+    assert edit(small["id"], payload(2500))["approval_status"] == "pending"
+    assert edit(small["id"], payload(1800))["approval_status"] == "approved"
+
+    # Approved by a buyer, then the amount goes up: the approval no longer covers it.
+    large = create(payload(4200))
+    r = client.patch(f"/requests/{large['id']}/approval", json={"decision": "approved"}, headers=_auth(buyer))
+    assert r.json()["approval_status"] == "approved"
+    assert edit(large["id"], payload(4500))["approval_status"] == "pending"
+
+    # BMW has no limit: everything needs approval.
+    assert create(payload(1500), token=_signin("admin@bmw.com"))["approval_status"] == "pending"
+
+    # Admins set the limit on the organization page; a negative limit is rejected.
+    admin = _auth(_signin("admin@acme.com"))
+    assert client.patch("/organizations/me/settings", json={"auto_approve_below": -1}, headers=admin).status_code == 422
+
+
+def test_catalog_suggestions(monkeypatch):
+    """The MacBook gets Acme's cheapest ultralight laptop; the grinder gets nothing;
+    no saving is claimed when the units differ; BMW (no catalog) gets nothing."""
+    from app.core.config import settings
+    from app.db.session import get_db as _get_db
+    from app.models import Organization
+    from app.services import catalog
+
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(catalog, "OpenAI", FakeOpenAI)
+    db = next(app.dependency_overrides[_get_db]())
+    acme_id = db.scalar(select(Organization.id).where(Organization.slug == "acme"))
+    items = [description for description, _ in catalog.catalog_items(acme_id, db)]
+    laptop = items.index('Business laptop 13" ultralight / 16 GB / 1 TB') + 1
+    moss_wall = items.index("Custom moss wall, preserved reindeer moss, made to measure") + 1
+
+    FakeOpenAI.requests = []
+    FakeOpenAI.replies = [{"matches": [
+        {"line": 1, "item": laptop, "match": "comparable", "reason": "Another brand of 13-inch laptop."},
+        {"line": 2, "item": None, "match": None, "reason": "No grinding machines in the catalog."},
+        {"line": 3, "item": moss_wall, "match": "same", "reason": "A preserved moss wall."},
+    ]}]
+    lines = [
+        {"positionDescription": '13" MacBook Air M2, 16 GB, 512 GB', "amount": 1, "unit": "piece", "unitPrice": 1467.61},
+        {"positionDescription": "Schleifmaschine HN-GS 450", "amount": 1, "unit": "piece", "unitPrice": 15000},
+        {"positionDescription": "Moosbild 160x80 cm", "amount": 1, "unit": "piece", "unitPrice": 1438},
+    ]
+    r = client.post("/articles/suggest", json={"lines": lines}, headers=_auth(_signin("requester@acme.com")))
+    assert r.status_code == 200, r.text
+    by_line = {s["lineIndex"]: s for s in r.json()}
+
+    assert set(by_line) == {0, 2}  # nothing for the grinder
+    offers = by_line[0]["offers"]
+    assert offers[0] == {"articleNumber": "DEL-00905", "supplierName": "Delacroix Systems GmbH",
+                         "supplierVatId": offers[0]["supplierVatId"], "unitPrice": 1438.0, "unit": "piece"}
+    assert [o["unitPrice"] for o in offers] == sorted(o["unitPrice"] for o in offers)  # cheapest first
+    assert by_line[0]["saving"] == 29.61
+    assert by_line[2]["saving"] is None  # €/m² vs. a picture priced per piece: no fake saving
+
+    # BMW has no catalog: no suggestions, and no model call at all.
+    FakeOpenAI.requests = []
+    r = client.post("/articles/suggest", json={"lines": lines}, headers=_auth(_signin("admin@bmw.com")))
+    assert r.json() == [] and FakeOpenAI.requests == []
+
+
+def test_extraction_survives_missing_vat_id(monkeypatch):
+    """A quote without a VAT ID (Hoffmann) used to fail the whole extraction. Now both
+    passes run, neither finds one, and it's reported as missing."""
+    no_vat = {**COMPLETE_REPLY, "vendorName": "Hoffmann Nurnberg GmbH", "vatId": None}
+    token = _use_fake_openai(monkeypatch, no_vat, no_vat, pdf_text="Angebot ANG-HN-2026-041 ...")
+
+    body = _upload_for_extraction(token)
+
+    assert body["success"] is True, body
+    assert len(FakeOpenAI.requests) == 2
+    assert body["data"]["vatId"] is None
+    assert "VAT ID" in body["missingFields"]
+
+
+def test_extraction_scanned_pdf_goes_straight_to_pdf(monkeypatch):
+    """No text layer (a scan): skip the text pass and send the PDF right away."""
+    token = _use_fake_openai(monkeypatch, COMPLETE_REPLY, pdf_text="")
+
+    body = _upload_for_extraction(token)
+
+    assert body["success"] is True, body
+    assert len(FakeOpenAI.requests) == 1
+    assert _sent_pdf(FakeOpenAI.requests[0])
 
 
 def test_commodity_groups_expanded():
@@ -730,7 +1082,7 @@ def test_org_settings_required_fields():
     # Default settings: nothing extra required.
     r = client.get("/organizations/me/settings", headers=_auth(token))
     assert r.status_code == 200
-    assert r.json() == {"required_fields": []}
+    assert r.json() == {"required_fields": [], "classification_rules": [], "auto_approve_below": None}
 
     base_payload = {
         "requestorName": "S", "titleShortDescription": "T", "vendorName": "V",

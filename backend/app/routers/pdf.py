@@ -9,8 +9,11 @@ router = APIRouter(prefix="/pdf", tags=["pdf"])
 MAX_PDF_BYTES = 10 * 1024 * 1024  # 10 MB, matches the upload UI's stated limit
 
 
-@router.post("/parse", response_model=PdfParseResponse, dependencies=[Depends(get_current_user)])
-async def parse_pdf(file: UploadFile) -> PdfParseResponse:
+async def read_pdf_upload(file: UploadFile) -> bytes:
+    """Read an uploaded file, rejecting anything that isn't a PDF of at most 10 MB.
+
+    Shared by /pdf/parse and /extraction.
+    """
     if file.content_type not in ("application/pdf", "application/x-pdf"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload a PDF file"
@@ -22,6 +25,12 @@ async def parse_pdf(file: UploadFile) -> PdfParseResponse:
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="PDF exceeds the 10MB limit",
         )
+    return pdf_bytes
+
+
+@router.post("/parse", response_model=PdfParseResponse, dependencies=[Depends(get_current_user)])
+async def parse_pdf(file: UploadFile) -> PdfParseResponse:
+    pdf_bytes = await read_pdf_upload(file)
 
     try:
         text = extract_text(pdf_bytes)

@@ -1,8 +1,7 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { useMutation } from '@tanstack/react-query';
 import * as api from '@/lib/api';
 import { useCommodityGroups } from '@/lib/hooks/useCommodityGroups';
 import { Button, Input, Alert, Loader } from '@/components/base';
@@ -13,6 +12,8 @@ interface OrderLine {
   amount: number;
   unit: string;
   totalPrice: number;
+  position?: string | null; // as printed on the quote, e.g. "1.1"
+  alternativeTo?: string | null; // for alternatives: the position they replace
 }
 
 export default function NewRequestPage() {
@@ -26,8 +27,12 @@ export default function NewRequestPage() {
   const [vatId, setVatId] = useState('');
   const [department, setDepartment] = useState('');
   const [commodityGroupId, setCommodityGroupId] = useState<number | null>(null);
+  const [classificationNote, setClassificationNote] = useState<string | null>(null);
   const [orderLines, setOrderLines] = useState<OrderLine[]>([]);
-  const [totalCost, setTotalCost] = useState<number>(0);
+  const [alternatives, setAlternatives] = useState<OrderLine[]>([]);
+  const [catalogSuggestions, setCatalogSuggestions] = useState<api.CatalogSuggestion[]>([]);
+  const [checkingCatalog, setCheckingCatalog] = useState(false);
+  const [extraCosts, setExtraCosts] = useState<api.ExtractedVendorData['extraCosts']>([]);
 
   // UI state
   const [file, setFile] = useState<File | null>(null);
@@ -35,17 +40,37 @@ export default function NewRequestPage() {
   const [success, setSuccess] = useState('');
   const [warning, setWarning] = useState('');
   const [extracting, setExtracting] = useState(false);
+  const [slowExtraction, setSlowExtraction] = useState(false);
 
-  // PDF parsing mutation
-  const parsePDFMutation = useMutation({
-    mutationFn: async (file: File) => {
-      const result = await api.pdf.parse(file);
-      if (!result.text) {
-        throw new Error('Failed to parse PDF');
-      }
-      return result.text;
-    },
-  });
+  // The net total, as on the quote: the lines plus extra costs (shipping, fees, levies)
+  const extraCostsTotal = extraCosts.reduce((sum, cost) => sum + cost.amount, 0);
+  const totalCost = orderLines.reduce((sum, line) => sum + line.totalPrice, 0) + extraCostsTotal;
+
+  // The text pass alone took up to ~8 s in our evals. Past that, the backend may be
+  // scanning the PDF pages, so the spinner says so (without claiming it for sure).
+  useEffect(() => {
+    if (!extracting) {
+      setSlowExtraction(false);
+      return;
+    }
+    const timer = setTimeout(() => setSlowExtraction(true), 8000);
+    return () => clearTimeout(timer);
+  }, [extracting]);
+
+  // A request opened from a catalog card ("Order from catalog instead") arrives prefilled via the link
+  useEffect(() => {
+    const prefill = new URLSearchParams(window.location.search).get('prefill');
+    if (!prefill) return;
+    const draft = JSON.parse(prefill);
+    setTitle(draft.title);
+    setRequestorName(draft.requestorName);
+    setDepartment(draft.department);
+    setCommodityGroupId(draft.commodityGroupId);
+    setVendorName(draft.vendorName);
+    setVatId(draft.vatId);
+    setOrderLines([draft.line]);
+    setSuccess('Prefilled from your catalog. Please check the quantity and submit.');
+  }, []);
 
   // Handle file upload and extraction
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -64,11 +89,8 @@ export default function NewRequestPage() {
     setExtracting(true);
 
     try {
-      // Step 1: Parse PDF
-      const pdfText = await parsePDFMutation.mutateAsync(uploadedFile);
-
-      // Step 2: Extract structured data AND classify commodity group in one AI call
-      const extractionResult = await api.extraction.extract(pdfText);
+      // Send the PDF itself; the backend reads it and classifies the commodity group.
+      const extractionResult = await api.extraction.extract(uploadedFile);
       
       if (!extractionResult.success || !extractionResult.data) {
         throw new Error(extractionResult.error || 'Failed to extract data');
@@ -76,27 +98,42 @@ export default function NewRequestPage() {
 
       const extracted = extractionResult.data;
 
-      // Step 3: Auto-fill form (including commodity group from extraction)
+      // Auto-fill form (including commodity group from extraction)
       setTitle(extracted.title || '');
       setVendorName(extracted.vendorName || '');
       setVatId(extracted.vatId || '');
       setDepartment(extracted.department || '');
-      setOrderLines(extracted.orderLines || []);
-      setTotalCost(extracted.totalCost || 0);
+      // The lines being bought; extra costs (shipping, fees) get their own rows below them.
+      // Alternatives are listed separately; the user can swap one in.
+      const lines = extracted.orderLines.filter((line) => !line.isAlternative);
+      setOrderLines(lines);
+      setExtraCosts(extracted.extraCosts);
+      setAlternatives(extracted.orderLines.filter((line) => line.isAlternative));
       
       // Set commodity group (now included in extraction)
       if (extracted.commodityGroupId) {
         setCommodityGroupId(extracted.commodityGroupId);
       }
+      setClassificationNote(extractionResult.classificationNote ?? null);
+      checkCatalog(lines); // runs in the background; the cards appear when it's done
 
-      // Show warnings for missing fields
+      // Show warnings for missing fields and for values the text and PDF readings disagreed on
+      const notes: string[] = [];
       if (extractionResult.missingFields && extractionResult.missingFields.length > 0) {
-        setWarning(
-          `⚠️ Could not extract: ${extractionResult.missingFields.join(', ')}. Please fill in these fields manually.`
+        notes.push(
+          `Could not extract: ${extractionResult.missingFields.join(', ')}. Please fill in these fields manually.`
         );
       }
+      notes.push(...(extractionResult.warnings ?? []));
+      if (notes.length > 0) {
+        setWarning(`⚠️ ${notes.join(' ')}`);
+      }
 
-      setSuccess('✓ PDF extracted successfully! Review and submit.');
+      setSuccess(
+        extractionResult.scannedBecause
+          ? `✓ Scanned the PDF pages (${extractionResult.scannedBecause}). Review and submit.`
+          : '✓ PDF extracted successfully! Review and submit.'
+      );
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
       console.error('Extraction error:', err);
@@ -132,18 +169,72 @@ export default function NewRequestPage() {
     }
     
     setOrderLines(updated);
-    
-    // Update total cost
-    const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
-    setTotalCost(newTotal);
+  };
+
+  // Ask which catalog articles (negotiated prices) match the lines. Optional help:
+  // if it fails, the form simply shows no suggestions.
+  const checkCatalog = async (lines: OrderLine[]) => {
+    if (lines.length === 0) return;
+    setCheckingCatalog(true);
+    try {
+      setCatalogSuggestions(await api.articles.suggest(lines));
+    } catch {
+      setCatalogSuggestions([]);
+    } finally {
+      setCheckingCatalog(false);
+    }
+  };
+
+  // Open the catalog article as its own request in a new tab. A request has one vendor, and
+  // lines like delivery or levies belong to the quoted item, so this request stays as it is.
+  const orderFromCatalog = (index: number, suggestion: api.CatalogSuggestion) => {
+    const offer = suggestion.offers[0];
+    const amount = orderLines[index].amount;
+    const draft = {
+      title,
+      requestorName,
+      department,
+      commodityGroupId,
+      vendorName: offer.supplierName,
+      vatId: offer.supplierVatId ?? '',
+      line: {
+        positionDescription: `${suggestion.articleDescription} (${offer.articleNumber})`,
+        unitPrice: offer.unitPrice,
+        amount,
+        unit: offer.unit,
+        totalPrice: offer.unitPrice * amount,
+      },
+    };
+    window.open(`/dashboard/new-request?prefill=${encodeURIComponent(JSON.stringify(draft))}`, '_blank');
   };
 
   // Remove order line
   const removeOrderLine = (index: number) => {
+    setCatalogSuggestions([]); // suggestions refer to line positions, which shift now
     const updated = orderLines.filter((_, i) => i !== index);
     setOrderLines(updated);
-    const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
-    setTotalCost(newTotal);
+  };
+
+  // Swap an alternative in for the line it replaces; that line becomes an alternative
+  // itself, so the user can swap back. Other alternatives to the same line follow along.
+  const swapInAlternative = (index: number) => {
+    setCatalogSuggestions([]); // they were for the line being replaced
+    const chosen = alternatives[index];
+    const replacedIndex = orderLines.findIndex((line) => line.position === chosen.alternativeTo);
+    const updated = [...orderLines];
+    const remaining = alternatives
+      .filter((_, i) => i !== index)
+      .map((alt) =>
+        alt.alternativeTo === chosen.alternativeTo ? { ...alt, alternativeTo: chosen.position } : alt
+      );
+    if (replacedIndex === -1) {
+      updated.push({ ...chosen, alternativeTo: null }); // what it replaced is gone: just add it
+    } else {
+      remaining.push({ ...updated[replacedIndex], alternativeTo: chosen.position });
+      updated[replacedIndex] = { ...chosen, alternativeTo: null };
+    }
+    setOrderLines(updated);
+    setAlternatives(remaining);
   };
 
   // Submit form
@@ -175,7 +266,17 @@ export default function NewRequestPage() {
         commodityGroupId: commodityGroupId,
         totalCost,
         department,
-        orderLines,
+        // The database has only lines and one total, so extra costs are saved as labelled lines
+        orderLines: [
+          ...orderLines,
+          ...extraCosts.map((cost) => ({
+            positionDescription: `${cost.label} (extra cost)`,
+            unitPrice: cost.amount,
+            amount: 1,
+            unit: 'lump sum',
+            totalPrice: cost.amount,
+          })),
+        ],
       });
 
       // Attach the original PDF (if one was uploaded) so it shows on the detail page.
@@ -234,7 +335,11 @@ export default function NewRequestPage() {
               {extracting ? (
                 <div className="flex flex-col items-center">
                   <Loader size="lg" />
-                  <p className="mt-4 text-sm text-gray-600">Extracting data from PDF...</p>
+                  <p className="mt-4 text-sm text-gray-600">
+                    {slowExtraction
+                      ? "Still working… if something wasn't in the text, we're now scanning the PDF pages."
+                      : 'Reading the quote text…'}
+                  </p>
                 </div>
               ) : file ? (
                 <div>
@@ -349,6 +454,11 @@ export default function NewRequestPage() {
                 </option>
               ))}
             </select>
+            {classificationNote && (
+              <p className="mt-1.5 text-sm text-ink/45">
+                Pre-selected by your company&apos;s {classificationNote}. You can still change it.
+              </p>
+            )}
           </div>
         </div>
 
@@ -356,9 +466,20 @@ export default function NewRequestPage() {
         <div className="lio-card p-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-semibold tracking-tight text-ink">Order Lines *</h2>
-            <Button type="button" onClick={addOrderLine} variant="outline" size="sm">
-              + Add Line
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                onClick={() => checkCatalog(orderLines)}
+                variant="outline"
+                size="sm"
+                disabled={checkingCatalog || orderLines.length === 0}
+              >
+                {checkingCatalog ? 'Checking your catalog…' : 'Check catalog'}
+              </Button>
+              <Button type="button" onClick={addOrderLine} variant="outline" size="sm">
+                + Add Line
+              </Button>
+            </div>
           </div>
 
           {orderLines.length === 0 ? (
@@ -430,11 +551,116 @@ export default function NewRequestPage() {
                       €{line.totalPrice.toFixed(2)}
                     </span>
                   </div>
+
+                  {catalogSuggestions
+                    .filter((suggestion) => suggestion.lineIndex === index)
+                    .map((suggestion) => (
+                      <div
+                        key={suggestion.articleDescription}
+                        className="mt-3 flex items-start justify-between gap-4 rounded-lg border border-accent/40 bg-accent-soft/20 p-3 text-sm"
+                      >
+                        <div>
+                          <p className="font-medium text-ink">
+                            On your catalog ({suggestion.match}): {suggestion.articleDescription}
+                          </p>
+                          <p className="text-gray-600">
+                            {suggestion.offers[0].supplierName} · €{suggestion.offers[0].unitPrice.toFixed(2)} /{' '}
+                            {suggestion.offers[0].unit}
+                            {suggestion.saving !== null && ` · saves €${suggestion.saving.toFixed(2)}`}
+                          </p>
+                          <p className="text-gray-500">{suggestion.reason}</p>
+                          <p className="mt-1 text-xs text-gray-500">
+                            Opens a separate request. If you order from the catalog, remove this line here and
+                            anything that belongs to it (delivery, levies).
+                          </p>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => orderFromCatalog(index, suggestion)}
+                        >
+                          Order from catalog instead
+                        </Button>
+                      </div>
+                    ))}
                 </div>
               ))}
             </div>
           )}
+
+          {/* Extra costs from the quote: not items, but part of the total */}
+          {extraCosts.length > 0 && (
+            <div className="mt-6">
+              <h3 className="text-sm font-medium text-gray-700 mb-2">Extra costs</h3>
+              <div className="space-y-2">
+                {extraCosts.map((cost, index) => (
+                  <div key={index} className="flex items-end gap-3">
+                    <div className="flex-1">
+                      <Input
+                        value={cost.label}
+                        onChange={(e) =>
+                          setExtraCosts(extraCosts.map((c, i) => (i === index ? { ...c, label: e.target.value } : c)))
+                        }
+                        required
+                      />
+                    </div>
+                    <div className="w-36 shrink-0">
+                      <Input
+                        type="number"
+                        step="0.01"
+                        value={cost.amount}
+                        onChange={(e) =>
+                          setExtraCosts(
+                            extraCosts.map((c, i) => (i === index ? { ...c, amount: parseFloat(e.target.value) || 0 } : c))
+                          )
+                        }
+                        required
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setExtraCosts(extraCosts.filter((_, i) => i !== index))}
+                      className="text-red-600 hover:text-red-700 text-sm h-11"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
+
+        {/* Alternatives offered by the vendor: not in the total until swapped in */}
+        {alternatives.length > 0 && (
+          <div className="lio-card p-6">
+            <h2 className="text-xl font-semibold tracking-tight text-ink mb-1">Alternatives offered</h2>
+            <p className="text-sm text-gray-600 mb-4">
+              Not included in the total. Swap one in to buy it instead.
+            </p>
+            <div className="space-y-2">
+              {alternatives.map((alt, index) => (
+                <div
+                  key={index}
+                  className="flex items-center justify-between gap-4 border border-dashed border-gray-300 rounded-lg p-3 text-sm text-gray-600"
+                >
+                  <span>
+                    {alt.position && `Pos. ${alt.position} `}
+                    {alt.alternativeTo && `(instead of ${alt.alternativeTo}): `}
+                    {alt.positionDescription}
+                  </span>
+                  <span className="flex items-center gap-3 whitespace-nowrap">
+                    €{alt.totalPrice.toFixed(2)}
+                    <Button type="button" variant="outline" size="sm" onClick={() => swapInAlternative(index)}>
+                      Use this instead
+                    </Button>
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Total Cost */}
         <div className="bg-accent-soft/20 border-2 border-accent/40 rounded-lg p-6">
@@ -444,6 +670,9 @@ export default function NewRequestPage() {
               €{totalCost.toFixed(2)}
             </span>
           </div>
+          {extraCostsTotal > 0 && (
+            <p className="text-sm text-gray-600 text-right mt-1">incl. €{extraCostsTotal.toFixed(2)} extra costs</p>
+          )}
         </div>
 
         {/* Submit */}
